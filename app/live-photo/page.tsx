@@ -446,7 +446,7 @@ export default function LivePhotoPage() {
       return;
     }
     if (!window.isSecureContext) {
-      setShareNotice("直接存入相册需要 HTTPS，普通局域网 HTTP 只能使用 ZIP。");
+      setShareNotice("保存文件需要 HTTPS，普通局域网 HTTP 只能使用 ZIP。");
       return;
     }
 
@@ -472,7 +472,7 @@ export default function LivePhotoPage() {
         return;
       }
       if (error instanceof DOMException && error.name === "NotAllowedError") {
-        setShareNotice("系统拦截了分享面板，请再点一次「直接存入相册」。");
+        setShareNotice("系统拦截了分享面板，请再点一次「保存照片和视频」。");
         return;
       }
       setShareNotice("系统分享未能打开，请使用 ZIP 兜底。");
@@ -485,7 +485,7 @@ export default function LivePhotoPage() {
         error instanceof DOMException &&
         error.name === "NotAllowedError"
       ) {
-        setShareNotice("系统拦截了分享面板，请再点一次「直接存入相册」。");
+        setShareNotice("系统拦截了分享面板，请再点一次「保存照片和视频」。");
         return;
       }
       setShareNotice("系统分享未能打开，请使用 ZIP 兜底。");
@@ -508,7 +508,7 @@ export default function LivePhotoPage() {
     actions.push({ label: "开始生成", primary: true, onClick: generate });
   } else if (step === "done") {
     actions.push({
-      label: shareState === "loading" ? "准备相册文件…" : "直接存入相册",
+      label: shareState === "loading" ? "准备文件中…" : "保存照片和视频",
       primary: true,
       disabled: shareState === "loading",
       onClick: saveToPhotos,
@@ -1012,7 +1012,7 @@ export default function LivePhotoPage() {
                           className="btn-primary flex w-full items-center justify-center gap-2 !py-4"
                         >
                           <Share2 className="h-5 w-5" />
-                          直接存入相册
+                          保存照片和视频
                         </button>
                       )}
                       {shareState === "error" && shareError && (
@@ -1023,7 +1023,7 @@ export default function LivePhotoPage() {
                       {shareState !== "loading" && (
                         <p className="mt-2 text-center text-[11px] leading-relaxed text-white/35">
                           {shareSupported
-                            ? "点击后在 iOS 系统面板选择「存储 2 个项目」，无需解压"
+                            ? "网页只能保存为两个独立文件（照片 + 视频），Safari 无法直接写入实况照片。需要真正的实况照片请看下方 Mac 导入指南"
                             : typeof window !== "undefined" &&
                                 !window.isSecureContext
                               ? "直存需要 HTTPS；当前地址只能使用 ZIP 兜底"
@@ -1031,6 +1031,33 @@ export default function LivePhotoPage() {
                         </p>
                       )}
                     </div>
+                    {/* 实况照片合成指南 */}
+                    <details className="glass mt-4 rounded-2xl p-4 text-left">
+                      <summary className="cursor-pointer text-sm font-medium text-white/80">
+                        如何合成为真正的实况照片？（Mac 导入指南）
+                      </summary>
+                      <ol className="mt-3 list-decimal space-y-2 pl-5 text-[13px] leading-relaxed text-white/60">
+                        <li>点击「下载 ZIP」获取照片 + 视频文件对。</li>
+                        <li>用隔空投送发到 Mac 并解压到同一文件夹。</li>
+                        <li>
+                          打开 Mac 的照片 App，把两个文件一起拖进去（或菜单：文件
+                          &gt; 导入）。
+                        </li>
+                        <li>
+                          照片 App 会按内置标识自动识别为一张实况照片（带 LIVE
+                          标记）。
+                        </li>
+                        <li>
+                          在 Mac 和 iPhone 上登录同一 Apple ID 并开启 iCloud
+                          照片同步，实况照片会自动同步到手机相册。
+                        </li>
+                      </ol>
+                      <p className="mt-3 text-[11px] leading-relaxed text-white/35">
+                        说明：Safari
+                        网页没有调用系统相册配对写入的权限，只能交付文件对；配对步骤需在苹果官方 App
+                        内完成。以上流程基于 macOS 照片 App 的公开行为，未在真机逐项验证。
+                      </p>
+                    </details>
                     <div className="flex flex-col gap-3 sm:flex-row sm:justify-center">
                       <a
                         href={realResult.download_url}
