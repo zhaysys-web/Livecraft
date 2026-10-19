@@ -74,6 +74,53 @@ function abs(url: string): string {
 }
 
 /**
+ * 带上传进度的 POST（fetch 不支持上传进度，这里用 XHR）。
+ * 返回与 fetch Response 兼容的最小接口（ok/status/json/text）。
+ */
+function xhrPost(
+  url: string,
+  body: FormData,
+  onProgress: (loaded: number, total: number) => void,
+  timeoutMs: number,
+): Promise<Response> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", url);
+    xhr.timeout = timeoutMs;
+    xhr.responseType = "text";
+    if (xhr.upload) {
+      xhr.upload.onprogress = (e) => {
+        if (e.lengthComputable) onProgress(e.loaded, e.total);
+      };
+    }
+    xhr.onload = () => {
+      const headers = new Headers();
+      xhr
+        .getAllResponseHeaders()
+        .trim()
+        .split(/[\r\n]+/)
+        .forEach((line) => {
+          const idx = line.indexOf(":");
+          if (idx > 0)
+            headers.append(line.slice(0, idx).trim(), line.slice(idx + 1).trim());
+        });
+      resolve(
+        new Response(xhr.responseText, {
+          status: xhr.status,
+          statusText: xhr.statusText,
+          headers,
+        }),
+      );
+    };
+    xhr.onerror = () => reject(new Error("网络请求失败，请检查网络后重试"));
+    xhr.ontimeout = () =>
+      reject(new Error("请求超时（10 分钟），请试试更短的视频或稍后重试"));
+    xhr.onabort = () => reject(new DOMException("aborted", "AbortError"));
+    xhr.send(body);
+  });
+}
+
+/**
  * 带超时的 fetch。超时后抛出中文错误（Render 冷启动场景下提示用户稍后重试）。
  * 注意：转码请求走同步后端，超时必须远大于单次转码耗时。
  */
@@ -101,6 +148,7 @@ export async function fetchWithTimeout(
 export async function livePhotoConvert(
   video: File,
   p: LivePhotoParams,
+  onUploadProgress?: (loaded: number, total: number) => void,
 ): Promise<LivePhotoResult> {
   const fd = new FormData();
   fd.append("video", video);
@@ -112,12 +160,14 @@ export async function livePhotoConvert(
   fd.append("muted", String(p.muted));
   fd.append("audio_fade_secs", String(p.audioFadeSecs ?? 0.2));
   if (p.contentIdentifier) fd.append("content_identifier", p.contentIdentifier);
-  // 转码在服务端同步执行，超时设为 10 分钟
-  const res = await fetchWithTimeout(
-    `${mediaBase()}/api/live-photo`,
-    { method: "POST", body: fd },
-    600000,
-  );
+  // 转码在服务端同步执行，超时设为 10 分钟；上传进度用 XHR（fetch 不支持）
+  const res = onUploadProgress
+    ? await xhrPost(`${mediaBase()}/api/live-photo`, fd, onUploadProgress, 600000)
+    : await fetchWithTimeout(
+        `${mediaBase()}/api/live-photo`,
+        { method: "POST", body: fd },
+        600000,
+      );
   if (!res.ok) {
     const text = await res.text();
     let detail = text;

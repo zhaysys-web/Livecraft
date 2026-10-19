@@ -33,8 +33,7 @@ yarn-error.log*
 next-env.d.ts
 
 # python media-service
-__pycache__/
-*.pyc
+media-service/__pycache__/
 media-service/.venv/
 media-service/*.egg-info/
 

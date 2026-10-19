@@ -17,7 +17,7 @@ import uuid
 import zipfile
 from pathlib import Path
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 
 from app.core import config
@@ -91,6 +91,7 @@ def _safe_suffix(filename: str | None) -> str:
 
 @router.post("/live-photo")
 async def create_live_photo(
+    request: Request,
     video: UploadFile = File(...),
     duration_mode: str = Form("3"),
     clip_start: str = Form("0"),
@@ -162,21 +163,34 @@ async def create_live_photo(
         prefer_copy=True,
     )
 
+    # 信号量获取加 60 秒超时：避免在僵尸任务占满槽位时无限排队。
+    # 客户端超时/刷新后服务端任务不会自动取消，排队过久直接 503 让前端明确报错。
     try:
-        async with _transcode_semaphore:
+        await asyncio.wait_for(_transcode_semaphore.acquire(), timeout=60)
+    except asyncio.TimeoutError:
+        shutil.rmtree(directory, ignore_errors=True)
+        raise HTTPException(503, "服务器正忙，请稍后重试") from None
+
+    try:
+        # 客户端已断开（超时/刷新/切后台）就不必再转码，直接释放槽位
+        if await request.is_disconnected():
+            raise HTTPException(499, "客户端已断开连接")
+        try:
             result = await asyncio.to_thread(
                 livephoto.run_livephoto_job, src, directory, params
             )
-    except subprocess.CalledProcessError as exc:
-        shutil.rmtree(directory, ignore_errors=True)
-        detail = (exc.stderr or "FFmpeg 处理失败").strip()[-800:]
-        raise HTTPException(422, f"视频处理失败：{detail}") from exc
-    except (ValueError, RuntimeError) as exc:
-        shutil.rmtree(directory, ignore_errors=True)
-        raise HTTPException(422, str(exc)) from exc
-    except Exception:
-        shutil.rmtree(directory, ignore_errors=True)
-        raise
+        except subprocess.CalledProcessError as exc:
+            shutil.rmtree(directory, ignore_errors=True)
+            detail = (exc.stderr or "FFmpeg 处理失败").strip()[-800:]
+            raise HTTPException(422, f"视频处理失败：{detail}") from exc
+        except (ValueError, RuntimeError) as exc:
+            shutil.rmtree(directory, ignore_errors=True)
+            raise HTTPException(422, str(exc)) from exc
+        except Exception:
+            shutil.rmtree(directory, ignore_errors=True)
+            raise
+    finally:
+        _transcode_semaphore.release()
 
     src.unlink(missing_ok=True)
 

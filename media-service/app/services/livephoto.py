@@ -6,8 +6,10 @@ the selected key frame -> stamp matching Apple identifiers -> verify.
 
 from __future__ import annotations
 
+import logging
 import math
 import subprocess
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
@@ -15,6 +17,8 @@ from pathlib import Path
 
 from app.services import ffmpeg_plan, livephoto_mov, metadata
 from app.core import config
+
+log = logging.getLogger("livecraft.livephoto")
 
 
 @dataclass
@@ -90,8 +94,20 @@ def run_livephoto_job(
     params: ffmpeg_plan.LivePhotoJobParams,
 ) -> LivePhotoResult:
     out_dir.mkdir(parents=True, exist_ok=True)
+    job_start = time.monotonic()
     info = ffmpeg_plan.probe_video(src)
     _prepare_params(params, info)
+    log.info(
+        "job start: job=%s duration=%.1fs src=%s %dx%d fps=%.1f codec=%s mode=%ss",
+        out_dir.name,
+        params.video_duration,
+        params.source_video_codec,
+        int(params.source_width),
+        int(params.source_height),
+        params.source_fps,
+        params.codec,
+        params.duration_mode,
+    )
 
     if params.video_duration > config.MAX_VIDEO_DURATION_SECS:
         raise ValueError(
@@ -101,9 +117,22 @@ def run_livephoto_job(
     still_path = out_dir / "still.jpg"
     mov_path = out_dir / "live.mov"
     plan = ffmpeg_plan.build_plan(params, src, mov_path, still_path)
+    log.info(
+        "plan: job=%s video_action=%s audio_action=%s export=%.1fs",
+        out_dir.name,
+        plan.video_action,
+        plan.audio_action,
+        plan.export_duration,
+    )
 
+    t0 = time.monotonic()
     subprocess.run(
         plan.video_cmd, capture_output=True, text=True, timeout=900, check=True
+    )
+    log.info(
+        "ffmpeg video done: job=%s elapsed=%.1fs",
+        out_dir.name,
+        time.monotonic() - t0,
     )
 
     output_duration = metadata.read_mov_duration(mov_path)
@@ -120,8 +149,14 @@ def run_livephoto_job(
             still_path,
             params.clip_start + effective_still_time,
         )
+    t0 = time.monotonic()
     subprocess.run(
         still_cmd, capture_output=True, text=True, timeout=300, check=True
+    )
+    log.info(
+        "ffmpeg still done: job=%s elapsed=%.1fs",
+        out_dir.name,
+        time.monotonic() - t0,
     )
 
     if still_path.stat().st_size < 1000 or mov_path.stat().st_size < 1000:
@@ -146,6 +181,14 @@ def run_livephoto_job(
         raise RuntimeError(f"MOV ContentIdentifier 回读不一致: {mov_id!r}")
     if abs(verified_mov.still_time - live_mov.still_time) > 0.01:
         raise RuntimeError("MOV still-image-time 元数据回读不一致")
+
+    log.info(
+        "job done: job=%s total=%.1fs still=%dB mov=%dB",
+        out_dir.name,
+        time.monotonic() - job_start,
+        still_path.stat().st_size,
+        mov_path.stat().st_size,
+    )
 
     return LivePhotoResult(
         still_path=still_path,

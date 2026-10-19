@@ -55,14 +55,6 @@ const STEPS: { id: Step; label: string }[] = [
   { id: "done", label: "完成" },
 ];
 
-/** 真实处理中的阶段文案（按耗时轮播） */
-const REAL_STAGES = [
-  "上传视频到媒体服务…",
-  "FFmpeg 原画质封装 / 兼容处理中…",
-  "注入实况元数据并校验…",
-  "准备 JPG / MOV 相册文件…",
-];
-
 /** 高级裁剪里视频解码超时（毫秒）：超时只提示，不阻塞生成 */
 const DECODE_TIMEOUT_MS = 15000;
 
@@ -113,6 +105,12 @@ export default function LivePhotoPage() {
   const [jobError, setJobError] = useState<string | null>(null);
   const [elapsed, setElapsed] = useState(0);
   const jobRunning = useRef(false);
+  /** 真实阶段：upload=上传中，process=服务端处理中（替代原来的时间轮播假进度） */
+  const [jobPhase, setJobPhase] = useState<"upload" | "process" | null>(null);
+  const [uploadProgress, setUploadProgress] = useState<{
+    loaded: number;
+    total: number;
+  } | null>(null);
 
   // 转换完成后先预取两个文件；点击按钮时只剩同步的 navigator.share 调用。
   const [shareFiles, setShareFiles] = useState<File[]>([]);
@@ -299,8 +297,14 @@ export default function LivePhotoPage() {
   const runRealJob = async () => {
     if (jobRunning.current || !videoFile) return;
     jobRunning.current = true;
+    setUploadProgress(null);
+    setJobPhase("upload");
     try {
-      const r = await livePhotoConvert(videoFile, buildParams());
+      const r = await livePhotoConvert(videoFile, buildParams(), (loaded, total) => {
+        setUploadProgress({ loaded, total });
+        // 上传完成（loaded 追上 total）后切换为服务端处理阶段
+        if (total > 0 && loaded >= total) setJobPhase("process");
+      });
       setRealResult(r);
       setStep("done");
     } catch (e) {
@@ -308,6 +312,8 @@ export default function LivePhotoPage() {
       setStep("ready");
     } finally {
       jobRunning.current = false;
+      setJobPhase(null);
+      setUploadProgress(null);
     }
   };
 
@@ -493,8 +499,6 @@ export default function LivePhotoPage() {
 
   const activeIdx =
     step === "working" ? 1 : STEPS.findIndex((s) => s.id === step);
-  const realStage =
-    REAL_STAGES[Math.min(Math.floor(elapsed / 6), REAL_STAGES.length - 1)];
 
   const actions: BarAction[] = [];
   if (step === "ready") {
@@ -580,8 +584,8 @@ export default function LivePhotoPage() {
             {step === "upload" && (
               <Dropzone
                 accept="video/*"
-                maxSizeMB={200}
-                hint="支持 MP4 / MOV 等视频格式 · 最大 200MB"
+                maxSizeMB={100}
+                hint="支持 MP4 / MOV 等视频格式 · 最大 100MB（CDN 上传上限）"
                 onFiles={handleFiles}
               />
             )}
@@ -836,18 +840,42 @@ export default function LivePhotoPage() {
                   </div>
                 </div>
                 <div className="mx-auto mt-8 max-w-md">
-                  <div className="h-2 overflow-hidden rounded-full bg-white/10">
-                    <div
-                      className="h-full rounded-full bg-gradient-to-r from-aurora-violet via-aurora-fuchsia to-aurora-cyan animate-shimmer"
-                      style={{
-                        backgroundSize: "200% 100%",
-                        width: "100%",
-                      }}
-                    />
-                  </div>
-                  <p className="mt-4 text-sm text-white/65">{realStage}</p>
+                  {jobPhase === "upload" && uploadProgress ? (
+                    <div>
+                      <div className="h-2 overflow-hidden rounded-full bg-white/10">
+                        <div
+                          className="h-full rounded-full bg-gradient-to-r from-aurora-violet to-aurora-cyan transition-[width] duration-200"
+                          style={{
+                            width: `${uploadProgress.total > 0 ? Math.min(100, (uploadProgress.loaded / uploadProgress.total) * 100).toFixed(1) : 0}%`,
+                          }}
+                        />
+                      </div>
+                      <p className="mt-4 text-sm text-white/65">
+                        正在上传视频…{(uploadProgress.loaded / 1048576).toFixed(1)} /{" "}
+                        {(uploadProgress.total / 1048576).toFixed(1)} MB
+                      </p>
+                    </div>
+                  ) : (
+                    <div>
+                      <div className="h-2 overflow-hidden rounded-full bg-white/10">
+                        <div
+                          className="h-full rounded-full bg-gradient-to-r from-aurora-violet via-aurora-fuchsia to-aurora-cyan animate-shimmer"
+                          style={{
+                            backgroundSize: "200% 100%",
+                            width: "100%",
+                          }}
+                        />
+                      </div>
+                      <p className="mt-4 text-sm text-white/65">
+                        {jobPhase === "upload"
+                          ? "正在上传视频…"
+                          : "服务端转码封装中…"}
+                      </p>
+                    </div>
+                  )}
                   <p className="mt-1.5 font-mono text-xs text-white/35">
-                    已耗时 {elapsed}s · 服务端正在封装 / 兼容处理，请稍候
+                    已耗时 {elapsed}s
+                    {jobPhase === "process" && " · 请勿切换到后台"}
                   </p>
                 </div>
               </div>
