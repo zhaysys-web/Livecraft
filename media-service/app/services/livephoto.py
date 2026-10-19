@@ -1,14 +1,19 @@
-"""视频转实况照片管道：探测 → 参数规划 → FFmpeg 转码 → 元数据注入 → 校验。"""
+"""Video -> Apple Live Photo pipeline.
+
+Flow: probe once -> normalize the requested window -> remux/encode -> extract
+the selected key frame -> stamp matching Apple identifiers -> verify.
+"""
 
 from __future__ import annotations
 
+import math
 import subprocess
 import uuid
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
-from app.services import ffmpeg_plan
-from app.services import metadata
+from app.services import ffmpeg_plan, livephoto_mov, metadata
 
 
 @dataclass
@@ -17,12 +22,63 @@ class LivePhotoResult:
     mov_path: Path
     content_identifier: str
     export_duration: float
-    still_image_time: int
+    output_duration: float
+    still_image_time: float
+    keyframe_offset: float
     clip_start: float
     keyframe_time: float
     needs_fallback: bool
     fallback: str
+    video_action: str
+    audio_action: str
+    source_video_codec: str
+    source_pix_fmt: str
     metadata_notes: list[str]
+    warnings: list[str]
+    file_base_name: str
+
+
+def _clamp(value: float, lower: float, upper: float) -> float:
+    return max(lower, min(value, upper))
+
+
+def _new_file_base_name() -> str:
+    stamp = datetime.now().strftime("IMG_%Y%m%d_%H%M%S")
+    return f"{stamp}_{uuid.uuid4().hex[:4].upper()}"
+
+
+def _prepare_params(
+    params: ffmpeg_plan.LivePhotoJobParams, info: dict
+) -> None:
+    params.video_duration = float(info["duration"])
+    params.source_fps = float(info["fps"])
+    params.source_has_audio = bool(info["has_audio"])
+    params.source_video_codec = str(info["video_codec"])
+    params.source_audio_codec = str(info["audio_codec"])
+    params.source_pix_fmt = str(info["pix_fmt"])
+    params.content_identifier = (
+        params.content_identifier.strip() or str(uuid.uuid4())
+    ).upper()
+
+    duration = ffmpeg_plan.export_duration(params)
+    short = ffmpeg_plan.needs_fallback(params.video_duration, params.duration_mode)
+    if short:
+        params.clip_start = 0.0
+    else:
+        params.clip_start = _clamp(
+            params.clip_start, 0.0, max(0.0, params.video_duration - duration)
+        )
+
+    if params.keyframe_time < 0:
+        params.keyframe_time = params.clip_start + duration / 2
+    if not math.isfinite(params.keyframe_time):
+        raise ValueError("封面帧时间无效")
+
+    latest = min(
+        params.video_duration - 0.02,
+        params.clip_start + duration - 0.02,
+    )
+    params.keyframe_time = _clamp(params.keyframe_time, params.clip_start, latest)
 
 
 def run_livephoto_job(
@@ -31,50 +87,75 @@ def run_livephoto_job(
     params: ffmpeg_plan.LivePhotoJobParams,
 ) -> LivePhotoResult:
     out_dir.mkdir(parents=True, exist_ok=True)
-
-    # 1) 探测源视频
     info = ffmpeg_plan.probe_video(src)
-    params.video_duration = info["duration"]
-    if not params.content_identifier:
-        params.content_identifier = str(uuid.uuid4())
-    # 封面帧钳制在导出区间内，避免越界
-    export_dur = ffmpeg_plan.export_duration(params)
-    short = ffmpeg_plan.needs_fallback(params.video_duration, params.duration_mode)
-    if short:
-        params.keyframe_time = min(max(params.keyframe_time, 0.0), info["duration"])
-    else:
-        lo = params.clip_start
-        params.keyframe_time = min(max(params.keyframe_time, lo), lo + export_dur)
-    params.clip_start = min(max(params.clip_start, 0.0), max(0.0, info["duration"] - export_dur if not short else 0.0))
+    _prepare_params(params, info)
 
     still_path = out_dir / "still.jpg"
     mov_path = out_dir / "live.mov"
     plan = ffmpeg_plan.build_plan(params, src, mov_path, still_path)
 
-    # 2) 静态图提取
-    subprocess.run(plan.still_cmd, capture_output=True, text=True, timeout=300, check=True)
-    # 3) 视频转码
-    subprocess.run(plan.video_cmd, capture_output=True, text=True, timeout=900, check=True)
+    subprocess.run(
+        plan.video_cmd, capture_output=True, text=True, timeout=900, check=True
+    )
 
-    # 4) 元数据注入与校验
-    metadata.inject_jpg_content_identifier(still_path, params.content_identifier)
+    output_duration = metadata.read_mov_duration(mov_path)
+    if output_duration < 0.1:
+        raise RuntimeError("输出的 MOV 时长无效")
+
+    effective_still_time = min(
+        max(0.0, plan.still_image_time), max(0.0, output_duration - 0.02)
+    )
+    still_cmd = plan.still_cmd
+    if abs(effective_still_time - plan.still_image_time) > 0.001:
+        still_cmd = ffmpeg_plan.build_still_command(
+            src,
+            still_path,
+            params.clip_start + effective_still_time,
+        )
+    subprocess.run(
+        still_cmd, capture_output=True, text=True, timeout=300, check=True
+    )
+
+    if still_path.stat().st_size < 1000 or mov_path.stat().st_size < 1000:
+        raise RuntimeError("生成的实况文件为空，请换一个视频重试")
+
+    metadata.inject_jpg_content_identifier(
+        still_path, params.content_identifier
+    )
     jpg_id = metadata.read_jpg_content_identifier(still_path)
     if jpg_id != params.content_identifier:
-        raise RuntimeError(f"静态图 ContentIdentifier 回读不一致: {jpg_id!r}")
-    mov_tags = metadata.read_mov_tags(mov_path)
-    mov_id = mov_tags.get("com.apple.quicktime.content-identifier", "")
+        raise RuntimeError(f"JPG ContentIdentifier 回读不一致: {jpg_id!r}")
+
+    live_mov = livephoto_mov.inject_apple_metadata(
+        mov_path,
+        params.content_identifier,
+        effective_still_time,
+        output_duration,
+    )
+    verified_mov = livephoto_mov.read_apple_metadata(mov_path)
+    mov_id = verified_mov.asset_id
     if mov_id != params.content_identifier:
-        raise RuntimeError(f".mov ContentIdentifier 回读不一致: {mov_id!r}")
+        raise RuntimeError(f"MOV ContentIdentifier 回读不一致: {mov_id!r}")
+    if abs(verified_mov.still_time - live_mov.still_time) > 0.01:
+        raise RuntimeError("MOV still-image-time 元数据回读不一致")
 
     return LivePhotoResult(
         still_path=still_path,
         mov_path=mov_path,
         content_identifier=params.content_identifier,
         export_duration=plan.export_duration,
-        still_image_time=round(params.keyframe_time),
+        output_duration=output_duration,
+        still_image_time=verified_mov.still_time,
+        keyframe_offset=effective_still_time,
         clip_start=params.clip_start,
-        keyframe_time=params.keyframe_time,
+        keyframe_time=params.clip_start + effective_still_time,
         needs_fallback=plan.needs_fallback,
         fallback=params.fallback,
+        video_action=plan.video_action,
+        audio_action=plan.audio_action,
+        source_video_codec=params.source_video_codec,
+        source_pix_fmt=params.source_pix_fmt,
         metadata_notes=plan.metadata_notes,
+        warnings=plan.warnings,
+        file_base_name=_new_file_base_name(),
     )

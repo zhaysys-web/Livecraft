@@ -3,8 +3,10 @@
 策略顺序（每一步失败自动降级到下一步）：
   1. 分享文本中提取 URL → 域名识别平台
   2. 跟随短链跳转（移动端 UA 伪装）拿到落地页
-  3. 平台专属提取：页面内嵌 JSON 正则 → 官方开放 API → 第三方解析引擎（可选）
-  4. 返回结构化错误（平台未知 / 网络受限 / 需要登录 / 视频已删除）
+  3. 平台专属提取：页面内嵌 JSON 正则 → 官方开放 API
+  4. 抖音 / TikTok 签名接口失败时降级到可配置的备用解析服务
+  5. 媒体直链改写为短期签名代理，浏览器无需处理 CDN Referer 校验
+  6. 返回结构化错误（平台未知 / 网络受限 / 需要登录 / 视频已删除）
 
 注意：各平台反爬策略经常变化，网络层（requests）在受限环境下可能不可用；
 所有网络失败都收敛为 ParserError，调用方按 error_code 分支提示用户。
@@ -12,14 +14,23 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import json
+import logging
 import re
+import threading
+import time
 from dataclasses import dataclass, field
 from typing import Literal
+from urllib.parse import urlencode, urlsplit
 
 import requests
 
 from app.core import config
+
+log = logging.getLogger("livecraft.parser")
 
 Platform = Literal["douyin", "kuaishou", "xiaohongshu", "tiktok"]
 
@@ -27,6 +38,49 @@ MOBILE_UA = (
     "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
     "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
 )
+
+DESKTOP_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/140.0.0.0 Safari/537.36"
+)
+
+_MEDIA_HOST_SUFFIXES = (
+    ".douyin.com",
+    ".douyinvod.com",
+    ".douyinpic.com",
+    ".douyincdn.com",
+    ".zjcdn.com",
+    ".dycdn.com",
+    ".bytedance.com",
+    ".bytecdn.com",
+    ".byteimg.com",
+    ".ibyteimg.com",
+    ".byteicdn.com",
+    ".ibytedtos.com",
+    ".pstatp.com",
+    ".snssdk.com",
+    ".amemv.com",
+    ".byteoversea.com",
+    ".tiktok.com",
+    ".tiktokcdn.com",
+    ".tiktokcdn-us.com",
+    ".tiktokv.com",
+    ".xhscdn.com",
+    ".xhscdn.net",
+    ".xhsimg.com",
+    ".kuaishou.com",
+    ".kwimgs.com",
+    ".kwaicdn.com",
+    ".kscloud.com",
+    ".yximgs.com",
+    ".gifshow.com",
+)
+
+_dtk_lock = threading.Lock()
+_dtk_cookie = ""
+_dtk_cookie_expires_at = 0.0
+_dtk_demo_credentials: tuple[str, str] | None = None
 
 _DOMAIN_PATTERNS: dict[Platform, list[str]] = {
     "douyin": [r"douyin\.com", r"v\.douyin\.com", r"iesdouyin\.com"],
@@ -51,6 +105,7 @@ class ParseResult:
     title: str = ""
     author: str = ""
     cover_url: str = ""
+    download_url: str = ""
     strategy: str = ""
     warnings: list[str] = field(default_factory=list)
 
@@ -239,6 +294,305 @@ def _extract_tiktok(final_url: str, html: str) -> ParseResult:
     raise ParserError("extract_failed", "未能从 TikTok 页面提取到视频地址")
 
 
+def _b64url_encode(value: str) -> str:
+    return base64.urlsafe_b64encode(value.encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def _b64url_decode(value: str) -> str:
+    padding = "=" * (-len(value) % 4)
+    return base64.urlsafe_b64decode(value + padding).decode("utf-8")
+
+
+def _proxy_signature(token: str, expires_at: int, download: str) -> str:
+    message = f"{token}.{expires_at}.{download}".encode("utf-8")
+    return hmac.new(
+        config.PARSER_PROXY_SECRET.encode("utf-8"), message, hashlib.sha256
+    ).hexdigest()
+
+
+def make_media_proxy_path(
+    video_url: str, *, download: bool = False, ttl_seconds: int | None = None
+) -> str:
+    """为上游媒体生成短期签名代理地址，避免浏览器直连 CDN 被 Referer 校验拦截。"""
+    expires_at = int(time.time()) + (
+        ttl_seconds or config.PARSER_PROXY_TTL_SECONDS
+    )
+    token = _b64url_encode(video_url)
+    download_flag = "1" if download else "0"
+    signature = _proxy_signature(token, expires_at, download_flag)
+    query = urlencode(
+        {
+            "token": token,
+            "exp": expires_at,
+            "download": download_flag,
+            "sig": signature,
+        }
+    )
+    return f"/api/parser/media?{query}"
+
+
+def validate_media_url(url: str) -> bool:
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return False
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return False
+    if parsed.username or parsed.password:
+        return False
+    host = parsed.hostname.lower().rstrip(".")
+    return any(
+        host == suffix[1:] or host.endswith(suffix)
+        for suffix in _MEDIA_HOST_SUFFIXES
+    )
+
+
+def verify_media_proxy(
+    token: str, expires_at: str, download: str, signature: str
+) -> str:
+    try:
+        expires = int(expires_at)
+    except (TypeError, ValueError):
+        return ""
+    download_flag = "1" if str(download).lower() in ("1", "true") else "0"
+    if expires < int(time.time()):
+        return ""
+    expected = _proxy_signature(token, expires, download_flag)
+    if not hmac.compare_digest(signature, expected):
+        return ""
+    try:
+        url = _b64url_decode(token)
+    except (ValueError, UnicodeDecodeError):
+        return ""
+    return url if validate_media_url(url) else ""
+
+
+def media_proxy_referer(url: str) -> str:
+    host = (urlsplit(url).hostname or "").lower()
+    if "tiktok" in host or "byteoversea" in host or "ibytedtos" in host:
+        return "https://www.tiktok.com/"
+    if any(
+        name in host
+        for name in (
+            "douyin", "douyinvod", "zjcdn", "dycdn", "bytecdn", "byteimg",
+            "pstatp", "snssdk", "amemv", "ibyteimg", "byteicdn",
+        )
+    ):
+        return "https://www.douyin.com/"
+    if "xhs" in host or "xiaohongshu" in host:
+        return "https://www.xiaohongshu.com/"
+    if "kuaishou" in host or "kwimgs" in host or "gifshow" in host:
+        return "https://www.kuaishou.com/"
+    return ""
+
+
+def media_proxy_request_headers(url: str, range_header: str = "") -> dict[str, str]:
+    headers = {
+        "User-Agent": DESKTOP_UA,
+        "Accept": "*/*",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    }
+    referer = media_proxy_referer(url)
+    if referer:
+        headers["Referer"] = referer
+    if range_header:
+        headers["Range"] = range_header
+    return headers
+
+
+def _dtk_credentials() -> tuple[str, str] | None:
+    global _dtk_demo_credentials
+    if config.PARSER_FALLBACK_USERNAME and config.PARSER_FALLBACK_PASSWORD:
+        return config.PARSER_FALLBACK_USERNAME, config.PARSER_FALLBACK_PASSWORD
+    if not config.PARSER_FALLBACK_DEMO:
+        return None
+    if _dtk_demo_credentials:
+        return _dtk_demo_credentials
+    try:
+        response = requests.get(
+            f"{config.PARSER_FALLBACK_API_URL}/api/v1/auth/demo",
+            timeout=12,
+            headers={"Accept": "application/json", "User-Agent": DESKTOP_UA},
+        )
+        response.raise_for_status()
+        data = response.json().get("data") or {}
+        username = str(data.get("username") or "")
+        password = str(data.get("password") or "")
+        if username and password:
+            _dtk_demo_credentials = (username, password)
+            return _dtk_demo_credentials
+    except (requests.RequestException, ValueError):
+        return None
+    return None
+
+
+def _dtk_login(*, force: bool = False) -> str:
+    global _dtk_cookie, _dtk_cookie_expires_at
+    if not force and _dtk_cookie and time.time() < _dtk_cookie_expires_at:
+        return _dtk_cookie
+
+    with _dtk_lock:
+        if not force and _dtk_cookie and time.time() < _dtk_cookie_expires_at:
+            return _dtk_cookie
+        credentials = _dtk_credentials()
+        if not credentials:
+            return ""
+        try:
+            response = requests.post(
+                f"{config.PARSER_FALLBACK_API_URL}/api/v1/auth/login",
+                json={"username": credentials[0], "password": credentials[1]},
+                timeout=15,
+                headers={"Accept": "application/json", "User-Agent": DESKTOP_UA},
+            )
+            response.raise_for_status()
+            data = response.json().get("data") or {}
+            cookie = response.cookies.get("dtk_session") or ""
+            if not cookie:
+                return ""
+            try:
+                expires_in = int(data.get("expires_in") or 604800)
+            except (TypeError, ValueError):
+                expires_in = 604800
+            _dtk_cookie = cookie
+            _dtk_cookie_expires_at = time.time() + max(60, expires_in - 60)
+            return cookie
+        except (requests.RequestException, ValueError):
+            return ""
+
+
+def _dtk_auth_headers(*, force: bool = False) -> dict[str, str] | None:
+    headers = {"Accept": "application/json", "User-Agent": DESKTOP_UA}
+    if config.PARSER_FALLBACK_API_KEY:
+        headers["X-API-Key"] = config.PARSER_FALLBACK_API_KEY
+        return headers
+    cookie = _dtk_login(force=force)
+    if not cookie:
+        return None
+    headers["Cookie"] = f"dtk_session={cookie}"
+    return headers
+
+
+def _dtk_parse_result(data: dict, platform: Platform) -> ParseResult | None:
+    if not isinstance(data, dict) or data.get("kind") != "video":
+        return None
+    media = data.get("media") or {}
+    candidates: list[dict] = []
+    main_video = media.get("video")
+    if isinstance(main_video, dict):
+        candidates.append(main_video)
+    streams = media.get("streams")
+    if isinstance(streams, list):
+        candidates.extend(v for v in streams if isinstance(v, dict))
+
+    candidates = [v for v in candidates if isinstance(v.get("url"), str) and v["url"]]
+    clean = [v for v in candidates if not v.get("watermark")]
+    pool = clean or candidates
+    if not pool:
+        return None
+
+    def quality(item: dict) -> tuple[int, int, int]:
+        width = item.get("width") if isinstance(item.get("width"), int) else 0
+        height = item.get("height") if isinstance(item.get("height"), int) else 0
+        bitrate = item.get("bitrate") if isinstance(item.get("bitrate"), int) else 0
+        return (width * height, bitrate, 1 if not item.get("watermark") else 0)
+
+    video = max(pool, key=quality)
+    covers = media.get("covers") or []
+    cover_url = ""
+    if isinstance(covers, list) and covers and isinstance(covers[0], dict):
+        cover_url = str(covers[0].get("url") or "")
+    author = data.get("author") or {}
+    author_name = str(author.get("nickname") or "") if isinstance(author, dict) else ""
+    title = str(data.get("title") or data.get("description") or "")[:200]
+    warnings = [
+        "平台官方接口风控升级，已通过第三方备用解析服务完成；分享链接会发送给该服务。"
+    ]
+    if not clean:
+        warnings.append("该视频源未提供明确的无水印版本，请预览后确认。")
+    return ParseResult(
+        platform=str(data.get("platform") or platform),
+        video_url=str(video["url"]),
+        title=title,
+        author=author_name,
+        cover_url=cover_url,
+        strategy="fallback_api",
+        warnings=warnings,
+    )
+
+
+def _parse_with_fallback_api(url: str, platform: Platform) -> ParseResult | None:
+    base = config.PARSER_FALLBACK_API_URL
+    if not base or platform not in ("douyin", "tiktok"):
+        return None
+
+    headers = _dtk_auth_headers()
+    if not headers:
+        return None
+
+    response = None
+    for attempt in range(2):
+        try:
+            response = requests.post(
+                f"{base}/api/v1/parse",
+                params={"wait": 30, "lang": "zh"},
+                json={"url": url},
+                headers=headers,
+                timeout=50,
+            )
+        except requests.RequestException as exc:
+            log.warning("fallback parser request failed: %s", exc)
+            return None
+        if response.status_code == 401 and attempt == 0 and not config.PARSER_FALLBACK_API_KEY:
+            refreshed = _dtk_auth_headers(force=True)
+            if refreshed:
+                headers = refreshed
+                continue
+        break
+
+    if response is None:
+        return None
+    try:
+        body = response.json()
+    except ValueError:
+        return None
+    if response.status_code not in (200, 202) or not body.get("success"):
+        log.warning(
+            "fallback parser rejected request: HTTP %s %s",
+            response.status_code,
+            body.get("error"),
+        )
+        return None
+
+    data = body.get("data") or {}
+    if response.status_code == 202 or data.get("state") in ("queued", "running"):
+        task_id = str(data.get("task_id") or "")
+        if not task_id:
+            return None
+        for _ in range(20):
+            time.sleep(1.0)
+            try:
+                poll = requests.get(
+                    f"{base}/api/v1/tasks/{task_id}",
+                    params={"lang": "zh"},
+                    headers=headers,
+                    timeout=20,
+                )
+                poll.raise_for_status()
+                task = poll.json().get("data") or {}
+            except (requests.RequestException, ValueError):
+                return None
+            state = str(task.get("state") or "")
+            if state == "done":
+                data = task.get("data") or {}
+                break
+            if state in ("failed", "error", "cancelled"):
+                return None
+        else:
+            return None
+
+    return _dtk_parse_result(data, platform)
+
+
 _EXTRACTORS = {
     "douyin": _extract_douyin,
     "kuaishou": _extract_kuaishou,
@@ -269,11 +623,35 @@ def _third_party_fallback(url: str) -> ParseResult | None:
 def parse_share_link(share_text: str) -> ParseResult:
     url = extract_share_url(share_text)
     platform = detect_platform(url)
-    final_url, html = resolve_redirects(url)
+    final_url = url
+    html = ""
+    last_error: ParserError | None = None
+
     try:
-        return _EXTRACTORS[platform](final_url, html)
-    except ParserError:
-        fb = _third_party_fallback(final_url)
-        if fb:
-            return fb
-        raise
+        final_url, html = resolve_redirects(url)
+    except ParserError as exc:
+        last_error = exc
+
+    if html:
+        try:
+            return _EXTRACTORS[platform](final_url, html)
+        except ParserError as exc:
+            last_error = exc
+
+    # 抖音 / TikTok 的网页接口已启用签名校验，优先走独立解析服务。
+    fallback = _parse_with_fallback_api(url, platform)
+    if fallback:
+        return fallback
+
+    fallback = _third_party_fallback(final_url or url)
+    if fallback:
+        return fallback
+
+    if platform in ("douyin", "tiktok"):
+        raise ParserError(
+            "extract_failed",
+            "平台风控或备用解析服务暂时不可用，请稍后重试，或换一条分享链接",
+        )
+    if last_error:
+        raise last_error
+    raise ParserError("extract_failed", "解析失败，请稍后重试或更换分享链接")

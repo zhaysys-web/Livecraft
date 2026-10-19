@@ -9,12 +9,14 @@ import io
 import subprocess
 import sys
 import tempfile
+import zipfile
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from app.services import ffmpeg_plan, inpaint as inpaint_svc, livephoto, metadata, parser as parser_svc  # noqa: E402
+from app.services import ffmpeg_plan, inpaint as inpaint_svc, livephoto, livephoto_mov, metadata, parser as parser_svc  # noqa: E402
 
 PASS: list[str] = []
 FAIL: list[str] = []
@@ -25,13 +27,36 @@ def check(name: str, cond: bool, detail: str = ""):
     print(f"[{'PASS' if cond else 'FAIL'}] {name}" + (f" — {detail}" if detail and not cond else ""))
 
 
-def make_video(path: Path, duration: float):
+def make_video(path: Path, duration: float, with_audio: bool = True):
     cmd = [
         "ffmpeg", "-y",
         "-f", "lavfi", "-i", f"testsrc=size=640x360:rate=30:duration={duration}",
+    ]
+    if with_audio:
+        cmd += ["-f", "lavfi", "-i", f"sine=frequency=440:duration={duration}"]
+    cmd += ["-c:v", "libx264", "-pix_fmt", "yuv420p"]
+    if with_audio:
+        cmd += ["-c:a", "aac", "-shortest"]
+    cmd.append(str(path))
+    subprocess.run(cmd, capture_output=True, check=True, timeout=120)
+
+
+def make_vp9_video(path: Path, duration: float):
+    cmd = [
+        "ffmpeg", "-y",
+        "-f", "lavfi", "-i", f"testsrc=size=320x180:rate=24:duration={duration}",
+        "-c:v", "libvpx-vp9", "-b:v", "220k", "-pix_fmt", "yuv420p", str(path),
+    ]
+    subprocess.run(cmd, capture_output=True, check=True, timeout=120)
+
+
+def make_opus_audio_video(path: Path, duration: float):
+    cmd = [
+        "ffmpeg", "-y",
+        "-f", "lavfi", "-i", f"testsrc=size=320x180:rate=24:duration={duration}",
         "-f", "lavfi", "-i", f"sine=frequency=440:duration={duration}",
         "-c:v", "libx264", "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-shortest", str(path),
+        "-c:a", "libopus", "-shortest", str(path),
     ]
     subprocess.run(cmd, capture_output=True, check=True, timeout=120)
 
@@ -43,8 +68,14 @@ def main() -> int:
     # ---------- 合成测试视频 ----------
     long_v = tmp / "long.mp4"
     short_v = tmp / "short.mp4"
+    silent_v = tmp / "silent.mp4"
+    vp9_v = tmp / "vp9.webm"
+    opus_v = tmp / "h264-opus.mkv"
     make_video(long_v, 8.0)
     make_video(short_v, 2.5)
+    make_video(silent_v, 6.0, with_audio=False)
+    make_vp9_video(vp9_v, 4.0)
+    make_opus_audio_video(opus_v, 4.0)
     long_info = ffmpeg_plan.probe_video(long_v)
     check("probe 8s 视频", abs(long_info["duration"] - 8.0) < 0.3 and long_info["has_audio"],
           str(long_info))
@@ -59,13 +90,20 @@ def main() -> int:
     check("3s 产物存在", r.still_path.exists() and r.mov_path.exists())
     dur = metadata.read_mov_duration(r.mov_path)
     check("3s 导出时长≈3.0", abs(dur - 3.0) < 0.25, f"got {dur}")
+    check("3s 走原画质流复制", r.video_action == "copy" and r.audio_action == "copy",
+          f"{r.video_action}/{r.audio_action}")
     check("mov ContentIdentifier 配对",
-          metadata.read_mov_tags(r.mov_path).get("com.apple.quicktime.content-identifier")
+          metadata.read_mov_tags(r.mov_path).get(metadata.CONTENT_IDENTIFIER_KEY)
           == "11111111-2222-3333-4444-555555555555")
     check("jpg MakerNote 配对",
           metadata.read_jpg_content_identifier(r.still_path)
           == "11111111-2222-3333-4444-555555555555")
-    check("still-image-time=4（3.5 四舍五入）", r.still_image_time == 4, str(r.still_image_time))
+    live_meta = livephoto_mov.read_apple_metadata(r.mov_path)
+    check("still-image-time 写入时间轨且使用片段内相对时间",
+          abs(live_meta.still_time - 1.5) < 0.01
+          and abs(r.still_image_time - 1.5) < 0.01
+          and live_meta.asset_id == r.content_identifier,
+          f"track={live_meta.still_time}, result={r.still_image_time}")
 
     # ---------- 5s 模式 ----------
     p5 = ffmpeg_plan.LivePhotoJobParams(
@@ -89,6 +127,33 @@ def main() -> int:
         check(f"兜底 {fb} 时长≈{expect}", abs(d - expect) < 0.4, f"got {d}")
         check(f"兜底 {fb} 标记 needs_fallback", rf.needs_fallback)
 
+    # ---------- 无音轨也必须能生成 ----------
+    ps = ffmpeg_plan.LivePhotoJobParams(
+        duration_mode=3, clip_start=1.0, keyframe_time=2.0,
+        fallback="pingpong", codec="h264", muted=False,
+    )
+    rs = livephoto.run_livephoto_job(silent_v, tmp / "job-silent", ps)
+    check("无音轨视频不报错", rs.mov_path.exists() and rs.audio_action == "none")
+
+    # ---------- QuickTime 不兼容的 VP9 自动回退转码 ----------
+    pv = ffmpeg_plan.LivePhotoJobParams(
+        duration_mode=3, clip_start=0.5, keyframe_time=1.5,
+        fallback="pingpong", codec="h264", muted=True,
+    )
+    rv = livephoto.run_livephoto_job(vp9_v, tmp / "job-vp9", pv)
+    check("VP9 自动回退兼容转码", rv.video_action == "reencode",
+          f"got {rv.video_action}")
+
+    # ---------- 视频可复制、音频需转码时不能谎报“未转码” ----------
+    pa = ffmpeg_plan.LivePhotoJobParams(
+        duration_mode=3, clip_start=0.5, keyframe_time=1.5,
+        fallback="pingpong", codec="h264", muted=False,
+    )
+    ra = livephoto.run_livephoto_job(opus_v, tmp / "job-opus", pa)
+    check("H.264 视频复制 + Opus 音频转码",
+          ra.video_action == "copy" and ra.audio_action == "reencode",
+          f"{ra.video_action}/{ra.audio_action}")
+
     # ---------- parser：离线平台识别 ----------
     samples = {
         "https://v.douyin.com/abc123/": "douyin",
@@ -107,6 +172,30 @@ def main() -> int:
         check("parser 未知平台抛错", False)
     except parser_svc.ParserError as e:
         check("parser 未知平台抛错", e.code == "unknown_platform", e.code)
+
+    media_url = "https://v3-web.douyinvod.com/demo/video.mp4?token=abc"
+    proxy_path = parser_svc.make_media_proxy_path(media_url)
+    proxy_query = parse_qs(urlsplit(proxy_path).query)
+    check(
+        "parser 媒体代理签名可回验",
+        parser_svc.verify_media_proxy(
+            proxy_query["token"][0],
+            proxy_query["exp"][0],
+            proxy_query["download"][0],
+            proxy_query["sig"][0],
+        ) == media_url,
+    )
+    check(
+        "parser 媒体代理拒绝篡改签名",
+        parser_svc.verify_media_proxy(
+            proxy_query["token"][0],
+            proxy_query["exp"][0],
+            proxy_query["download"][0],
+            "bad-signature",
+        ) == "",
+    )
+    check("parser 媒体代理拒绝非 CDN 域名",
+          not parser_svc.validate_media_url("http://127.0.0.1/private"))
 
     # ---------- inpaint ----------
     from PIL import Image, ImageDraw  # noqa: E402
@@ -135,7 +224,7 @@ def main() -> int:
         resp = client.post(
             "/api/live-photo",
             files={"video": ("long.mp4", f, "video/mp4")},
-            data={"duration_mode": "3", "clip_start": "1", "keyframe_time": "2.5",
+            data={"duration_mode": "3", "clip_start": "1", "keyframe_time": "",
                   "fallback": "pingpong", "codec": "h264", "muted": "false"},
         )
     check("POST /api/live-photo 200", resp.status_code == 200, resp.text[:300])
@@ -146,6 +235,33 @@ def main() -> int:
         z = client.get(body["download_url"])
         check("产物可下载", s.status_code == 200 and m.status_code == 200 and z.status_code == 200)
         check("meta 回传 UUID", len(body["meta"]["content_identifier"]) == 36)
+        check("空白封面帧自动取片段中点",
+              abs(body["meta"]["keyframe_time"] - 2.5) < 0.05,
+              str(body["meta"]["keyframe_time"]))
+        check("接口返回原画质标记", body["meta"]["no_reencode"] is True)
+        check("接口返回浮点 still-image-time",
+              abs(body["meta"]["still_image_time"] - 1.5) < 0.01,
+              str(body["meta"]["still_image_time"]))
+        base = body["meta"]["file_base_name"]
+        with zipfile.ZipFile(io.BytesIO(z.content)) as archive:
+            names = set(archive.namelist())
+        check("ZIP 内 JPG/MOV 同名",
+              names == {f"{base}.JPG", f"{base}.MOV"}, str(names))
+
+    with opus_v.open("rb") as f:
+        resp_opus = client.post(
+            "/api/live-photo",
+            files={"video": ("h264-opus.mkv", f, "video/x-matroska")},
+            data={"duration_mode": "3", "clip_start": "0.5",
+                  "keyframe_time": "1.5", "fallback": "pingpong",
+                  "codec": "h264", "muted": "false"},
+        )
+    check("API 不把音频转码谎报为完全未转码",
+          resp_opus.status_code == 200
+          and resp_opus.json()["meta"]["video_action"] == "copy"
+          and resp_opus.json()["meta"]["audio_action"] == "reencode"
+          and resp_opus.json()["meta"]["no_reencode"] is False,
+          resp_opus.text[:300])
 
     resp2 = client.post(
         "/api/inpaint",

@@ -9,10 +9,13 @@
 
 ## 1. 把代码推到 GitHub（3 条命令）
 
-本仓库已 `git init` 并提交，可直接推送：
+如果本地项目还不是 Git 仓库，先初始化；已经推送到 GitHub 的版本可直接提交本次改动：
 
 ```bash
 cd livecraft
+git init
+git add .
+git commit -m "feat: direct save Live Photo with no-reencode fast path"
 git remote add origin https://github.com/<你的用户名>/livecraft.git
 git branch -M main
 git push -u origin main
@@ -41,8 +44,12 @@ git push -u origin main
 ## 4. 验证
 
 打开 Vercel 地址：
-- 标题旁应显示 **「媒体服务已连接」**（而不是「演示模式」）
-- 跑一遍实况转码：上传视频 → 裁剪 → 生成 → 下载 ZIP 应为真实文件
+- 标题旁应显示 **「媒体服务已连接」**（而不是「服务未连接」）
+- 跑一遍实况转码：上传视频 → 选择 3 秒 / 5 秒 → 拖动定长裁剪框 → 选择封面帧 → 生成
+- 结果页主按钮应为 **「直接存入相册」**，ZIP 下载是次要兜底
+- 用 iPhone Safari 打开 HTTPS 地址，点击直存，在系统面板选择 **「存储 2 个项目」**，到系统相册确认已合并为实况照片
+
+> Web Share 多文件能力要求安全上下文：必须是 HTTPS。`http://192.168.x.x:3000` 这类局域网地址只能下载 ZIP，无法直接写入相册。
 
 ## 5. 说明与进阶
 
@@ -51,6 +58,8 @@ git push -u origin main
   装 Docker 后 `docker compose up --build -d` 即可（compose 文件已备好）。
 - **自用**：本机 `docker compose up --build`，`http://localhost:3000` 直接用，
   不花一分钱，速度还最快。
+- **手机直存**：使用 Vercel 的 HTTPS 地址，或给本地服务配置 HTTPS tunnel；并确保 `NEXT_PUBLIC_MEDIA_SERVICE_URL` 是手机能访问的后端地址，不能填 `localhost`。
+- **不重编码**：兼容的 H.264 / HEVC 视频走原码流复制；裁切边界受关键帧影响，导出时长可能比目标多约 0.1–0.2 秒，这是为了保证视频不重编码。
 - **自定义域名**：Vercel / Render 后台均可免费绑定（需自备域名）。
 - 以后更新代码：`git push` 后 Vercel 与 Render 都会自动重新部署。
 

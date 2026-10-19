@@ -16,4 +16,7 @@ services:
     envVars:
       - key: CORS_ORIGINS
         value: "*"
+      # 多实例部署时固定媒体代理签名
+      - key: PARSER_PROXY_SECRET
+        generateValue: true
       # Render 自动注入 $PORT，app/core/config.py 会优先读取，无需配置

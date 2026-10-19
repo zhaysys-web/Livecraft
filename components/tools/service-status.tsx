@@ -16,7 +16,7 @@ export function ServiceStatusPill() {
           ? "media-service 已连接，将调用真实处理管道"
           : status === "checking"
             ? "正在检测媒体服务…"
-            : "媒体服务未连接，当前为原型演示模式"
+            : "媒体服务未连接，请检查后端地址或网络"
       }
       className={cn(
         "inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-[11px] font-medium",
@@ -39,7 +39,7 @@ export function ServiceStatusPill() {
         ? "媒体服务已连接"
         : status === "checking"
           ? "检测服务中…"
-          : "演示模式"}
+          : "服务未连接"}
     </span>
   );
 }

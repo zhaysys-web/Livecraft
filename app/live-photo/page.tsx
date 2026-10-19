@@ -2,16 +2,17 @@
 
 import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
-import { AnimatePresence, motion } from "framer-motion";
+import { motion } from "framer-motion";
 import {
   ArrowLeft,
   Check,
   ChevronDown,
   Download,
-  FileImage,
   Film,
+  Loader2,
   RotateCcw,
   Scissors,
+  Share2,
   Volume2,
   VolumeX,
   AlertCircle,
@@ -26,7 +27,12 @@ import {
 } from "@/components/tools/mobile-action-bar";
 import { ServiceStatusPill } from "@/components/tools/service-status";
 import { useMediaService } from "@/hooks/use-media-service";
-import { livePhotoConvert, type LivePhotoResult, type LivePhotoParams } from "@/lib/media-client";
+import {
+  deleteLivePhotoJob,
+  livePhotoConvert,
+  type LivePhotoResult,
+  type LivePhotoParams,
+} from "@/lib/media-client";
 import {
   DURATION_MODES,
   FALLBACKS,
@@ -48,24 +54,40 @@ const STEPS: { id: Step; label: string }[] = [
   { id: "done", label: "完成" },
 ];
 
-/** 离线演示模式的分阶段文案 */
-const STAGES = [
-  "正在提取关键帧…",
-  "正在重封装为 H.264 / HEVC…",
-  "正在注入实况元数据…",
-  "正在打包下载文件…",
-];
-
-/** 真实转码中的阶段文案（按耗时轮播） */
+/** 真实处理中的阶段文案（按耗时轮播） */
 const REAL_STAGES = [
   "上传视频到媒体服务…",
-  "FFmpeg 转码封装中…",
+  "FFmpeg 原画质封装 / 兼容处理中…",
   "注入实况元数据并校验…",
-  "打包完成，准备下载…",
+  "准备 JPG / MOV 相册文件…",
 ];
 
 /** 高级裁剪里视频解码超时（毫秒）：超时只提示，不阻塞生成 */
 const DECODE_TIMEOUT_MS = 15000;
+
+type FileShareNavigator = Navigator & {
+  canShare?: (data: { files: File[] }) => boolean;
+  share?: (data: { files: File[]; title?: string }) => Promise<void>;
+};
+
+function supportsFileShare(files: File[]): boolean {
+  if (
+    typeof window === "undefined" ||
+    !window.isSecureContext ||
+    files.length !== 2
+  ) {
+    return false;
+  }
+  const nav = navigator as FileShareNavigator;
+  if (typeof nav.share !== "function" || typeof nav.canShare !== "function") {
+    return false;
+  }
+  try {
+    return Boolean(nav.canShare({ files }));
+  } catch {
+    return false;
+  }
+}
 
 export default function LivePhotoPage() {
   const [step, setStep] = useState<Step>("upload");
@@ -79,20 +101,26 @@ export default function LivePhotoPage() {
   const [muted, setMuted] = useState(true);
   const [fallback, setFallback] = useState<FallbackStrategy>("pingpong");
 
-  // 高级：自定义截取片段（需要浏览器解码预览，失败不阻塞）
-  const [customClip, setCustomClip] = useState(false);
+  // 时间轴与封面帧（浏览器解码失败时仍可直接生成）
   const [videoDuration, setVideoDuration] = useState(0);
   const [clipStart, setClipStart] = useState(0);
   const [keyframe, setKeyframe] = useState(0);
   const [decodeError, setDecodeError] = useState<string | null>(null);
-
-  const [stageIdx, setStageIdx] = useState(0);
 
   // 真实任务状态
   const [realResult, setRealResult] = useState<LivePhotoResult | null>(null);
   const [jobError, setJobError] = useState<string | null>(null);
   const [elapsed, setElapsed] = useState(0);
   const jobRunning = useRef(false);
+
+  // 转换完成后先预取两个文件；点击按钮时只剩同步的 navigator.share 调用。
+  const [shareFiles, setShareFiles] = useState<File[]>([]);
+  const [shareSupported, setShareSupported] = useState(false);
+  const [shareState, setShareState] = useState<
+    "idle" | "loading" | "ready" | "error"
+  >("idle");
+  const [shareError, setShareError] = useState<string | null>(null);
+  const [shareNotice, setShareNotice] = useState<string | null>(null);
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const serviceStatus = useMediaService();
@@ -119,33 +147,43 @@ export default function LivePhotoPage() {
     setVideoFile(f);
     setVideoUrl(URL.createObjectURL(f));
     setVideoName(f.name);
-    // 重置高级裁剪状态
-    setCustomClip(false);
+    // 重置时间轴与结果状态
     setVideoDuration(0);
     setClipStart(0);
     setKeyframe(0);
     setDecodeError(null);
     setRealResult(null);
     setJobError(null);
+    setShareFiles([]);
+    setShareSupported(false);
+    setShareState("idle");
+    setShareError(null);
+    setShareNotice(null);
     setStep("ready");
   };
 
   const reset = () => {
+    if (realResult?.job_id) {
+      void deleteLivePhotoJob(realResult.job_id).catch(() => {});
+    }
     setVideoFile(null);
     setVideoUrl(null);
     setVideoName("");
-    setCustomClip(false);
     setVideoDuration(0);
     setClipStart(0);
     setKeyframe(0);
     setDecodeError(null);
-    setStageIdx(0);
     setRealResult(null);
     setJobError(null);
+    setShareFiles([]);
+    setShareSupported(false);
+    setShareState("idle");
+    setShareError(null);
+    setShareNotice(null);
     setStep("upload");
   };
 
-  /** 高级裁剪：视频元数据就绪（仅在展开自定义片段时触发） */
+  /** 视频元数据就绪：初始化定长裁剪窗口与封面帧。 */
   const handleLoadedMetadata = () => {
     const v = videoRef.current;
     if (!v || !isFinite(v.duration) || v.duration <= 0) {
@@ -157,11 +195,17 @@ export default function LivePhotoPage() {
     setVideoDuration(d);
     setClipStart(0);
     setKeyframe(Math.round((effectiveWindow(d, durationMode) / 2) * 100) / 100);
+    try {
+      v.currentTime = 0;
+      void v.play().catch(() => {});
+    } catch {
+      // 自动播放被拦截时保留手动播放能力。
+    }
   };
 
-  /** 高级裁剪：解码超时保护——只提示，绝不卡死 */
+  /** 解码超时保护——只提示，绝不卡死生成流程。 */
   useEffect(() => {
-    if (!customClip) return;
+    if (step !== "ready" || !videoUrl) return;
     setDecodeError(null);
     const t = window.setTimeout(() => {
       const d = videoRef.current?.duration;
@@ -170,7 +214,7 @@ export default function LivePhotoPage() {
       }
     }, DECODE_TIMEOUT_MS);
     return () => window.clearTimeout(t);
-  }, [customClip, videoUrl]);
+  }, [step, videoUrl]);
 
   /** 切换 3s / 5s：窗口宽度联动，封面帧保持相对位置 */
   const changeMode = (m: DurationMode) => {
@@ -180,7 +224,7 @@ export default function LivePhotoPage() {
     const frac = oldWin > 0 ? (keyframe - clipStart) / oldWin : 0.5;
     const nk = Math.min(
       Math.max(newStart + frac * newWin, newStart),
-      newStart + newWin,
+      Math.max(newStart, newStart + newWin - 0.02),
     );
     setDurationMode(m);
     setClipStart(newStart);
@@ -190,9 +234,10 @@ export default function LivePhotoPage() {
   /** 拖动窗口：封面帧跟随窗口平移 */
   const handleStartChange = (s: number) => {
     const delta = s - clipStart;
+    const latestKeyframe = Math.max(s, s + win - 0.02);
     setClipStart(s);
     setKeyframe((k) =>
-      Math.round(Math.min(Math.max(k + delta, s), s + win) * 100) / 100,
+      Math.round(Math.min(Math.max(k + delta, s), latestKeyframe) * 100) / 100,
     );
     const v = videoRef.current;
     if (v && isFinite(v.duration)) {
@@ -204,11 +249,39 @@ export default function LivePhotoPage() {
     }
   };
 
+  /** 选择封面帧：暂停并即时跳到该帧供预览确认。 */
+  const handleKeyframeChange = (t: number) => {
+    const latest = Math.max(clipStart, clipStart + win - 0.02);
+    const next = Math.min(Math.max(t, clipStart), latest);
+    setKeyframe(Math.round(next * 100) / 100);
+    const v = videoRef.current;
+    if (!v || !isFinite(v.duration)) return;
+    try {
+      v.pause();
+      v.currentTime = t;
+    } catch {
+      // 某些移动浏览器可能拒绝 seek，不影响生成。
+    }
+  };
+
+  const handleVideoTimeUpdate = () => {
+    const v = videoRef.current;
+    if (!v || videoDuration <= 0) return;
+    const end = clipStart + win;
+    if (v.currentTime >= end || v.currentTime < clipStart - 0.05) {
+      try {
+        v.currentTime = clipStart;
+      } catch {
+        // 忽略 seek 失败。
+      }
+    }
+  };
+
   const buildParams = (): LivePhotoParams => ({
     durationMode,
-    clipStart: customClip ? clipStart : 0,
-    // 未自定义时传 null，后端自动取片段中点
-    keyframeTime: customClip ? keyframe : null,
+    clipStart: videoDuration > 0 ? clipStart : 0,
+    // 浏览器无法解码时交给后端自动取片段中点。
+    keyframeTime: videoDuration > 0 ? keyframe : null,
     fallback,
     codec,
     muted,
@@ -216,7 +289,7 @@ export default function LivePhotoPage() {
     contentIdentifier: newContentIdentifier(),
   });
 
-  /** 真实转码任务 */
+  /** 真实媒体处理任务 */
   const runRealJob = async () => {
     if (jobRunning.current || !videoFile) return;
     jobRunning.current = true;
@@ -225,7 +298,7 @@ export default function LivePhotoPage() {
       setRealResult(r);
       setStep("done");
     } catch (e) {
-      setJobError(e instanceof Error ? e.message : "转码失败，请重试");
+      setJobError(e instanceof Error ? e.message : "生成失败，请重试");
       setStep("ready");
     } finally {
       jobRunning.current = false;
@@ -235,35 +308,150 @@ export default function LivePhotoPage() {
   const generate = () => {
     setJobError(null);
     setRealResult(null);
-    setStageIdx(0);
     setElapsed(0);
     setStep("working");
-    if (online) {
-      runRealJob();
-    }
-    // 离线 → 由下方 effect 驱动演示进度
+    // 健康检查只用于提示，不能阻断真实转换：Render 冷启动时状态可能仍是 checking。
+    runRealJob();
   };
 
-  // 离线演示模式：模拟分阶段进度
+  /** 转换一完成就预取 JPG/MOV，保证点击时不必等待网络。 */
   useEffect(() => {
-    if (step !== "working" || online) return;
-    if (stageIdx >= STAGES.length) {
-      const t = window.setTimeout(() => setStep("done"), 600);
-      return () => window.clearTimeout(t);
+    if (!realResult) {
+      setShareFiles([]);
+      setShareSupported(false);
+      setShareState("idle");
+      setShareError(null);
+      return;
     }
-    const t = window.setTimeout(() => setStageIdx((i) => i + 1), 950);
-    return () => window.clearTimeout(t);
-  }, [step, stageIdx, online]);
 
-  // 真实转码：耗时计时
+    const controller = new AbortController();
+    setShareState("loading");
+    setShareError(null);
+    setShareSupported(false);
+    setShareNotice(null);
+
+    const prepare = async () => {
+      try {
+        const [stillResponse, movResponse] = await Promise.all([
+          fetch(realResult.still_url, { cache: "no-store", signal: controller.signal }),
+          fetch(realResult.mov_url, { cache: "no-store", signal: controller.signal }),
+        ]);
+        if (!stillResponse.ok || !movResponse.ok) {
+          throw new Error("生成文件暂时无法读取");
+        }
+        const [stillBlob, movBlob] = await Promise.all([
+          stillResponse.blob(),
+          movResponse.blob(),
+        ]);
+        if (!stillBlob.size || !movBlob.size) {
+          throw new Error("生成文件为空");
+        }
+        const baseName =
+          realResult.meta.file_base_name ||
+          `IMG_${realResult.job_id.toUpperCase()}`;
+        const files = [
+          new File([stillBlob], `${baseName}.JPG`, {
+            type: "image/jpeg",
+            lastModified: Date.now(),
+          }),
+          new File([movBlob], `${baseName}.MOV`, {
+            type: "video/quicktime",
+            lastModified: Date.now(),
+          }),
+        ];
+        if (controller.signal.aborted) return;
+        setShareFiles(files);
+        setShareSupported(supportsFileShare(files));
+        setShareState("ready");
+      } catch (error) {
+        if (controller.signal.aborted) return;
+        setShareState("error");
+        setShareError(
+          error instanceof Error ? error.message : "相册文件准备失败",
+        );
+      }
+    };
+
+    void prepare();
+    return () => controller.abort();
+  }, [realResult]);
+
+  /** navigator.share 必须在点击的同步调用栈里直接执行。 */
+  const saveToPhotos = () => {
+    const files = shareFiles;
+    const nav = navigator as FileShareNavigator;
+    if (shareState === "loading") {
+      setShareNotice("正在准备相册文件，请稍候再点。");
+      return;
+    }
+    if (shareState === "error" || files.length !== 2) {
+      setShareNotice(
+        shareError
+          ? `相册文件准备失败：${shareError}。请使用 ZIP 兜底。`
+          : "相册文件尚未准备好，请使用 ZIP 兜底。",
+      );
+      return;
+    }
+    if (typeof nav.share !== "function") {
+      setShareNotice("当前浏览器不支持系统分享，请使用 ZIP 兜底。");
+      return;
+    }
+    if (!window.isSecureContext) {
+      setShareNotice("直接存入相册需要 HTTPS，普通局域网 HTTP 只能使用 ZIP。");
+      return;
+    }
+
+    let canShare = false;
+    try {
+      canShare =
+        typeof nav.canShare === "function" && nav.canShare({ files });
+    } catch {
+      canShare = false;
+    }
+    if (!canShare) {
+      setShareNotice("系统没有授予文件分享能力，请使用 ZIP 兜底。");
+      return;
+    }
+
+    let sharePromise: Promise<void>;
+    try {
+      // 保持同步调用链：canShare 与 share 之间没有任何 await / 网络请求。
+      sharePromise = nav.share({ files, title: "LiveCraft 实况照片" });
+      setShareNotice("已打开系统面板，请选择「存储 2 个项目」。");
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") {
+        return;
+      }
+      if (error instanceof DOMException && error.name === "NotAllowedError") {
+        setShareNotice("系统拦截了分享面板，请再点一次「直接存入相册」。");
+        return;
+      }
+      setShareNotice("系统分享未能打开，请使用 ZIP 兜底。");
+      return;
+    }
+
+    void sharePromise.catch((error: unknown) => {
+      if (error instanceof DOMException && error.name === "AbortError") return;
+      if (
+        error instanceof DOMException &&
+        error.name === "NotAllowedError"
+      ) {
+        setShareNotice("系统拦截了分享面板，请再点一次「直接存入相册」。");
+        return;
+      }
+      setShareNotice("系统分享未能打开，请使用 ZIP 兜底。");
+    });
+  };
+
+  // 真实处理：耗时计时
   useEffect(() => {
-    if (step !== "working" || !online) return;
+    if (step !== "working") return;
     const t = window.setInterval(() => setElapsed((e) => e + 1), 1000);
     return () => window.clearInterval(t);
-  }, [step, online]);
+  }, [step]);
 
-  const progress = Math.min(100, ((stageIdx + 1) / STAGES.length) * 100);
-  const activeIdx = STEPS.findIndex((s) => s.id === step);
+  const activeIdx =
+    step === "working" ? 1 : STEPS.findIndex((s) => s.id === step);
   const realStage =
     REAL_STAGES[Math.min(Math.floor(elapsed / 6), REAL_STAGES.length - 1)];
 
@@ -272,7 +460,13 @@ export default function LivePhotoPage() {
     actions.push({ label: "重新选择", onClick: () => setStep("upload") });
     actions.push({ label: "开始生成", primary: true, onClick: generate });
   } else if (step === "done") {
-    actions.push({ label: "再做一个", primary: true, onClick: reset });
+    actions.push({
+      label: shareState === "loading" ? "准备相册文件…" : "直接存入相册",
+      primary: true,
+      disabled: shareState === "loading",
+      onClick: saveToPhotos,
+    });
+    actions.push({ label: "再做一个", onClick: reset });
   }
 
   const sizeMB = videoFile ? (videoFile.size / 1048576).toFixed(1) : "0";
@@ -336,14 +530,12 @@ export default function LivePhotoPage() {
       </div>
 
       <div className="mt-8">
-        <AnimatePresence mode="wait">
-          <motion.div
-            key={step}
-            initial={{ opacity: 0, y: 16 }}
-            animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0, y: -12 }}
-            transition={{ duration: 0.35, ease: [0.22, 1, 0.36, 1] }}
-          >
+        <motion.div
+          key={step}
+          initial={{ opacity: 0, y: 16 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.35, ease: [0.22, 1, 0.36, 1] }}
+        >
             {step === "upload" && (
               <Dropzone
                 accept="video/*"
@@ -364,7 +556,7 @@ export default function LivePhotoPage() {
 
                 {!online && (
                   <p className="rounded-2xl border border-white/10 bg-white/[0.02] px-4 py-3 text-center text-xs text-white/40">
-                    媒体服务未连接，当前为演示流程；后端上线后将调用真实转码
+                    媒体服务暂时未连通，仍会尝试真实转换；失败时请检查后端或刷新页面
                   </p>
                 )}
 
@@ -378,7 +570,7 @@ export default function LivePhotoPage() {
                       {videoName}
                     </p>
                     <p className="mt-1 text-xs text-white/40">
-                      {sizeMB} MB · 默认从开头截取 {durationMode}s，封面帧自动取中点
+                      {sizeMB} MB · 可拖动时间轴选择 {durationMode}s 精彩片段
                     </p>
                   </div>
                   <button
@@ -388,6 +580,107 @@ export default function LivePhotoPage() {
                     <RefreshCw className="h-3.5 w-3.5" />
                     换一个
                   </button>
+                </div>
+
+                {/* 时长模式 */}
+                <div className="glass rounded-3xl p-4 sm:p-5">
+                  <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+                    <div>
+                      <p className="text-sm font-medium text-white/85">
+                        实况时长
+                      </p>
+                      <p className="mt-0.5 text-xs text-white/35">
+                        定长裁剪窗口，切换后时间轴与导出参数实时同步
+                      </p>
+                    </div>
+                    <span className="chip !border-emerald-300/25 !bg-emerald-300/[0.07] !text-emerald-200">
+                      原画质优先 · 兼容则流复制
+                    </span>
+                  </div>
+                  <SegmentedControl
+                    id="ready-duration"
+                    options={DURATION_MODES}
+                    value={durationMode}
+                    onChange={changeMode}
+                  />
+                  <p className="mt-2.5 text-[11px] leading-relaxed text-white/30">
+                    兼容 H.264 / HEVC 视频走原码流复制，不重新编码；流复制边界受源视频关键帧影响，成片时长可能有约 0.1–0.2 秒误差。
+                  </p>
+                </div>
+
+                {/* 预览与定长滑动裁剪 */}
+                <div className="glass rounded-3xl p-4 sm:p-5">
+                  <div className="mb-3 flex items-center justify-between gap-3">
+                    <p className="flex items-center gap-2 text-sm font-medium text-white/85">
+                      <Scissors className="h-4 w-4 text-amber-200" />
+                      选择精彩片段与封面帧
+                    </p>
+                    <span className="font-mono text-[11px] text-white/35">
+                      {videoDuration > 0
+                        ? `总时长 ${formatClock(videoDuration)}`
+                        : "读取时长中…"}
+                    </span>
+                  </div>
+                  <div className="overflow-hidden rounded-2xl border border-white/10 bg-black">
+                    <video
+                      ref={videoRef}
+                      src={videoUrl ?? undefined}
+                      muted
+                      autoPlay
+                      playsInline
+                      controls
+                      preload="auto"
+                      onLoadedMetadata={handleLoadedMetadata}
+                      onTimeUpdate={handleVideoTimeUpdate}
+                      onError={() =>
+                        setDecodeError(
+                          "该视频无法在浏览器中预览；仍可直接生成，后端会完成裁切。",
+                        )
+                      }
+                      className="block max-h-[42vh] w-full object-contain"
+                    />
+                  </div>
+                  {decodeError ? (
+                    <p className="mt-3 rounded-xl border border-amber-300/25 bg-amber-300/[0.06] px-4 py-3 text-xs leading-relaxed text-amber-200">
+                      {decodeError}
+                    </p>
+                  ) : videoDuration > 0 ? (
+                    <div className="mt-4 space-y-3">
+                      <RangeTimeline
+                        duration={videoDuration}
+                        windowSecs={durationMode}
+                        start={clipStart}
+                        keyframe={keyframe}
+                        onStartChange={handleStartChange}
+                        onKeyframeChange={handleKeyframeChange}
+                      />
+                      <div className="flex flex-wrap items-center gap-3">
+                        <span className="chip !border-amber-300/30 !bg-amber-300/[0.08] !text-amber-200">
+                          封面帧 @ {keyframe.toFixed(2)}s
+                        </span>
+                        <button
+                          onClick={() =>
+                            handleKeyframeChange(
+                              Math.round((clipStart + win / 2) * 100) / 100,
+                            )
+                          }
+                          className="text-xs text-white/45 underline-offset-4 hover:text-white hover:underline"
+                        >
+                          重置到片段中点
+                        </button>
+                      </div>
+                      <p className="text-[11px] text-white/30">
+                        截取区间 {formatClock(clipStart)} –{" "}
+                        {formatClock(clipStart + win)} · 播放器会在区间内循环，
+                        拖动琥珀色游标选择 Key Photo
+                      </p>
+                    </div>
+                  ) : (
+                    <div className="mt-3 flex items-center gap-2 text-xs text-white/35">
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      正在读取视频时长；超时也不影响直接生成
+                    </div>
+                  )}
                 </div>
 
                 {/* 一键生成 */}
@@ -402,16 +695,9 @@ export default function LivePhotoPage() {
                     <ChevronDown className="h-4 w-4 text-white/40 transition-transform duration-300 group-open:rotate-180" />
                   </summary>
                   <div className="space-y-5 border-t border-white/10 px-5 py-5">
-                    <SegmentedControl
-                      id="ready-duration"
-                      options={DURATION_MODES}
-                      value={durationMode}
-                      onChange={changeMode}
-                    />
-
                     <div>
                       <label className="mb-2.5 block text-sm text-white/70">
-                        编码格式
+                        兼容转码编码（仅在源格式无法直封装时使用）
                       </label>
                       <div className="grid grid-cols-2 gap-3">
                         {(
@@ -495,90 +781,6 @@ export default function LivePhotoPage() {
                       </div>
                     </div>
 
-                    {/* 自定义截取片段 */}
-                    <div className="rounded-2xl border border-white/10 bg-black/20 p-4">
-                      <button
-                        onClick={() => setCustomClip((c) => !c)}
-                        className="flex w-full items-center justify-between text-sm text-white/80 transition-colors hover:text-white"
-                      >
-                        <span className="flex items-center gap-2">
-                          <Scissors className="h-4 w-4 text-amber-200" />
-                          自定义截取片段与封面帧
-                        </span>
-                        <ChevronDown
-                          className={cn(
-                            "h-4 w-4 text-white/40 transition-transform duration-300",
-                            customClip && "rotate-180",
-                          )}
-                        />
-                      </button>
-
-                      {customClip && (
-                        <div className="mt-4 space-y-4">
-                          {decodeError ? (
-                            <p className="rounded-xl border border-amber-300/25 bg-amber-300/[0.06] px-4 py-3 text-xs leading-relaxed text-amber-200">
-                              {decodeError}
-                            </p>
-                          ) : (
-                            <>
-                              <div className="overflow-hidden rounded-2xl border border-white/10 bg-black">
-                                <video
-                                  ref={videoRef}
-                                  src={videoUrl ?? undefined}
-                                  muted
-                                  playsInline
-                                  controls
-                                  preload="auto"
-                                  onLoadedMetadata={handleLoadedMetadata}
-                                  onError={() =>
-                                    setDecodeError(
-                                      "该视频无法在浏览器中预览；仍可直接生成。",
-                                    )
-                                  }
-                                  className="block max-h-[36vh] w-full object-contain"
-                                />
-                              </div>
-                              {videoDuration > 0 && (
-                                <>
-                                  <RangeTimeline
-                                    duration={videoDuration}
-                                    windowSecs={durationMode}
-                                    start={clipStart}
-                                    keyframe={keyframe}
-                                    onStartChange={handleStartChange}
-                                    onKeyframeChange={(t) =>
-                                      setKeyframe(Math.round(t * 100) / 100)
-                                    }
-                                  />
-                                  <div className="flex flex-wrap items-center gap-3">
-                                    <span className="chip !border-amber-300/30 !bg-amber-300/[0.08] !text-amber-200">
-                                      封面帧 @ {keyframe.toFixed(2)}s
-                                    </span>
-                                    <button
-                                      onClick={() =>
-                                        setKeyframe(
-                                          Math.round(
-                                            (clipStart + win / 2) * 100,
-                                          ) / 100,
-                                        )
-                                      }
-                                      className="text-xs text-white/45 underline-offset-4 hover:text-white hover:underline"
-                                    >
-                                      重置到片段中点
-                                    </button>
-                                  </div>
-                                  <p className="text-[11px] text-white/30">
-                                    截取区间 {formatClock(clipStart)} –{" "}
-                                    {formatClock(clipStart + win)}
-                                    ，封面帧将写入 still-image-time 元数据
-                                  </p>
-                                </>
-                              )}
-                            </>
-                          )}
-                        </div>
-                      )}
-                    </div>
                   </div>
                 </details>
               </div>
@@ -593,65 +795,33 @@ export default function LivePhotoPage() {
                   </div>
                 </div>
                 <div className="mx-auto mt-8 max-w-md">
-                  {online ? (
-                    <>
-                      <div className="h-2 overflow-hidden rounded-full bg-white/10">
-                        <div
-                          className="h-full rounded-full bg-gradient-to-r from-aurora-violet via-aurora-fuchsia to-aurora-cyan animate-shimmer"
-                          style={{
-                            backgroundSize: "200% 100%",
-                            width: "100%",
-                          }}
-                        />
-                      </div>
-                      <p className="mt-4 text-sm text-white/65">{realStage}</p>
-                      <p className="mt-1.5 font-mono text-xs text-white/35">
-                        已耗时 {elapsed}s · 服务端正在转码，请稍候
-                      </p>
-                    </>
-                  ) : (
-                    <>
-                      <div className="h-2 overflow-hidden rounded-full bg-white/10">
-                        <div
-                          className="h-full rounded-full bg-gradient-to-r from-aurora-violet via-aurora-fuchsia to-aurora-cyan transition-all duration-700"
-                          style={{ width: `${progress}%` }}
-                        />
-                      </div>
-                      <div className="mt-4 min-h-[24px]">
-                        <AnimatePresence mode="wait">
-                          <motion.p
-                            key={stageIdx}
-                            initial={{ opacity: 0, y: 6 }}
-                            animate={{ opacity: 1, y: 0 }}
-                            exit={{ opacity: 0, y: -6 }}
-                            className="text-sm text-white/65"
-                          >
-                            {STAGES[Math.min(stageIdx, STAGES.length - 1)]}
-                          </motion.p>
-                        </AnimatePresence>
-                      </div>
-                    </>
-                  )}
+                  <div className="h-2 overflow-hidden rounded-full bg-white/10">
+                    <div
+                      className="h-full rounded-full bg-gradient-to-r from-aurora-violet via-aurora-fuchsia to-aurora-cyan animate-shimmer"
+                      style={{
+                        backgroundSize: "200% 100%",
+                        width: "100%",
+                      }}
+                    />
+                  </div>
+                  <p className="mt-4 text-sm text-white/65">{realStage}</p>
+                  <p className="mt-1.5 font-mono text-xs text-white/35">
+                    已耗时 {elapsed}s · 服务端正在封装 / 兼容处理，请稍候
+                  </p>
                 </div>
               </div>
             )}
 
-            {step === "done" && (
+            {step === "done" && realResult && (
               <div className="glass shadow-card rounded-3xl p-6 text-center sm:p-10">
                 <span className="mx-auto grid h-14 w-14 place-items-center rounded-full bg-emerald-400/15">
                   <Check className="h-7 w-7 text-emerald-300" />
                 </span>
                 <h2 className="font-display mt-4 text-2xl font-bold">
                   实况照片已生成
-                  {!realResult && (
-                    <span className="ml-2.5 rounded-full bg-aurora-violet/15 px-2.5 py-1 align-middle text-[11px] font-medium text-aurora-violet">
-                      原型演示
-                    </span>
-                  )}
                 </h2>
 
-                {realResult ? (
-                  <div className="mx-auto mt-6 max-w-md space-y-2.5 text-left">
+                <div className="mx-auto mt-6 max-w-md space-y-2.5 text-left">
                     <div className="overflow-hidden rounded-2xl border border-white/10">
                       <img
                         src={realResult.still_url}
@@ -660,17 +830,36 @@ export default function LivePhotoPage() {
                       />
                     </div>
                     <div className="rounded-2xl border border-white/10 bg-white/[0.02] p-3.5 text-sm">
-                      <div className="flex justify-between gap-4">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <span className="text-white/55">处理方式</span>
+                        <span
+                          className={cn(
+                            "rounded-full px-2.5 py-1 text-[11px] font-medium",
+                            realResult.meta.video_action === "copy"
+                              ? "bg-emerald-400/15 text-emerald-200"
+                              : "bg-amber-300/15 text-amber-200",
+                          )}
+                        >
+                          {realResult.meta.video_action !== "copy"
+                            ? "兼容转码"
+                            : realResult.meta.no_reencode
+                              ? "视频 / 音频均未重编码"
+                              : realResult.meta.audio_action === "reencode"
+                                ? "视频原画质 · 音频转 AAC"
+                                : "视频原画质流复制"}
+                        </span>
+                      </div>
+                      <div className="mt-2.5 flex justify-between gap-4">
                         <span className="text-white/40">导出时长</span>
                         <span className="font-mono text-white">
-                          {realResult.meta.export_duration.toFixed(1)}s
+                          {realResult.meta.output_duration.toFixed(2)}s
                         </span>
                       </div>
                       <div className="mt-1.5 flex justify-between gap-4">
                         <span className="text-white/40">封面帧</span>
-                        <span className="font-mono text-amber-200">
-                          {realResult.meta.keyframe_time.toFixed(2)}s → still-image-time{" "}
-                          {realResult.meta.still_image_time}s
+                        <span className="text-right font-mono text-amber-200">
+                          原片 {realResult.meta.keyframe_time.toFixed(2)}s · 片段内{" "}
+                          {realResult.meta.keyframe_offset.toFixed(2)}s
                         </span>
                       </div>
                       {realResult.meta.needs_fallback && (
@@ -683,72 +872,87 @@ export default function LivePhotoPage() {
                           </span>
                         </div>
                       )}
+                      <div className="mt-2.5 border-t border-white/10 pt-2.5">
+                        <p className="break-all font-mono text-[11px] text-white/65">
+                          {realResult.meta.file_base_name}.JPG +{" "}
+                          {realResult.meta.file_base_name}.MOV
+                        </p>
+                        <p className="mt-1 text-[11px] text-white/35">
+                          同名配对 · 请在系统面板中同时保存两个项目
+                        </p>
+                      </div>
                     </div>
                     <div className="rounded-2xl border border-white/10 bg-black/30 p-3.5">
                       <p className="text-[11px] tracking-wider text-white/35">
-                        元数据校验通过（图片与视频严格匹配）
+                        元数据校验通过 · JPG / MOV 标识严格匹配
                       </p>
                       <p className="mt-1.5 break-all font-mono text-[11px] leading-relaxed text-white/60">
                         {realResult.meta.content_identifier}
                       </p>
                     </div>
-                    <div className="flex flex-col gap-3 pt-2 sm:flex-row sm:justify-center">
+                    {realResult.meta.warnings.length > 0 && (
+                      <p className="rounded-xl border border-amber-300/25 bg-amber-300/[0.06] px-3.5 py-2.5 text-[11px] leading-relaxed text-amber-200">
+                        {realResult.meta.warnings.join(" ")}
+                      </p>
+                    )}
+                    {shareNotice && (
+                      <p className="rounded-xl border border-white/10 bg-white/[0.04] px-3.5 py-2.5 text-center text-xs leading-relaxed text-white/65">
+                        {shareNotice}
+                      </p>
+                    )}
+
+                    <div className="pt-2">
+                      {shareState === "loading" ? (
+                        <button
+                          disabled
+                          className="btn-primary flex w-full items-center justify-center gap-2 opacity-70"
+                        >
+                          <Loader2 className="h-4 w-4 animate-spin" />
+                          正在准备相册文件…
+                        </button>
+                      ) : (
+                        <button
+                          onClick={saveToPhotos}
+                          className="btn-primary flex w-full items-center justify-center gap-2 !py-4"
+                        >
+                          <Share2 className="h-5 w-5" />
+                          直接存入相册
+                        </button>
+                      )}
+                      {shareState === "error" && shareError && (
+                        <p className="mt-2 text-center text-[11px] text-amber-200/80">
+                          {shareError}，请使用 ZIP。
+                        </p>
+                      )}
+                      {shareState !== "loading" && (
+                        <p className="mt-2 text-center text-[11px] leading-relaxed text-white/35">
+                          {shareSupported
+                            ? "点击后在 iOS 系统面板选择「存储 2 个项目」，无需解压"
+                            : typeof window !== "undefined" &&
+                                !window.isSecureContext
+                              ? "直存需要 HTTPS；当前地址只能使用 ZIP 兜底"
+                              : "当前浏览器不支持多文件分享；请使用 ZIP 兜底"}
+                        </p>
+                      )}
+                    </div>
+                    <div className="flex flex-col gap-3 sm:flex-row sm:justify-center">
                       <a
                         href={realResult.download_url}
                         download
-                        className="btn-primary"
+                        className="btn-ghost"
                       >
                         <Download className="h-4 w-4" />
-                        下载 ZIP（真实文件）
+                        下载 ZIP 兜底
                       </a>
                       <button onClick={reset} className="btn-ghost">
                         <RotateCcw className="h-4 w-4" />
                         再做一个
                       </button>
                     </div>
-                  </div>
-                ) : (
-                  <>
-                    <div className="mx-auto mt-6 max-w-md space-y-2.5 text-left">
-                      <div className="flex items-center gap-3 rounded-2xl border border-white/10 bg-white/[0.02] p-3.5">
-                        <FileImage className="h-5 w-5 shrink-0 text-aurora-cyan" />
-                        <div className="text-sm">
-                          <p className="font-mono text-white/85">IMG_COVER.HEIC</p>
-                          <p className="mt-0.5 text-xs text-white/40">
-                            封面帧 · 与视频共享 ContentIdentifier
-                          </p>
-                        </div>
-                      </div>
-                      <div className="flex items-center gap-3 rounded-2xl border border-white/10 bg-white/[0.02] p-3.5">
-                        <Film className="h-5 w-5 shrink-0 text-aurora-violet" />
-                        <div className="text-sm">
-                          <p className="font-mono text-white/85">IMG_COVER.MOV</p>
-                          <p className="mt-0.5 text-xs text-white/40">
-                            演示数据 · 后端上线后生成真实文件
-                          </p>
-                        </div>
-                      </div>
-                    </div>
-                    <div className="mt-6 flex flex-col items-center gap-3 sm:flex-row sm:justify-center">
-                      <button
-                        disabled
-                        title="后端上线后可下载真实文件"
-                        className="btn-primary cursor-not-allowed opacity-40"
-                      >
-                        <Download className="h-4 w-4" />
-                        下载 ZIP
-                      </button>
-                      <button onClick={reset} className="btn-ghost">
-                        <RotateCcw className="h-4 w-4" />
-                        再做一个
-                      </button>
-                    </div>
-                  </>
-                )}
+                </div>
               </div>
             )}
-          </motion.div>
-        </AnimatePresence>
+        </motion.div>
       </div>
 
       {/* 桌面端操作栏 */}

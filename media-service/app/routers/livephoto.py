@@ -1,24 +1,15 @@
-"""POST /api/live-photo：视频转实况照片。
+"""POST /api/live-photo: convert a video into an Apple Live Photo pair.
 
-multipart 表单：
-  video: 视频文件（必填）
-  duration_mode: 3 | 5（默认 3）
-  clip_start: 裁剪窗口起始秒（默认 0）
-  keyframe_time: 封面帧时间戳秒（默认片段中点）
-  fallback: pingpong | slowdown | keep（默认 pingpong）
-  codec: h264 | hevc（默认 h264）
-  muted: true | false（默认 false）
-  audio_fade_secs: 音频淡入淡出秒（默认 0.2）
-  content_identifier: 可选 UUID；不传则服务端生成
-
-返回 JSON：{ job_id, still_url, mov_url, download_url, meta{...} }
-文件通过 GET /api/jobs/{job_id}/{still.jpg|live.mov} 拉取，
-GET /api/jobs/{job_id}/download 一次性拿 zip（still.jpg + live.mov）。
+Response JSON: { job_id, still_url, mov_url, download_url, meta{...} }
+JPG/MOV can be fetched separately for Web Share, or as a same-basename ZIP for
+the compatibility fallback.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
+import re
 import shutil
 import subprocess
 import time
@@ -34,28 +25,65 @@ from app.services import ffmpeg_plan, livephoto
 
 router = APIRouter(prefix="/api", tags=["live-photo"])
 
-_JOBS: dict[str, dict] = {}
+_JOB_ID_RE = re.compile(r"^[a-f0-9]{12}$")
+_UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
 
 
-def _job_dir(job_id: str) -> Path:
-    d = config.DATA_DIR / "livephoto" / job_id
-    d.mkdir(parents=True, exist_ok=True)
-    return d
+def _livephoto_root() -> Path:
+    return (config.DATA_DIR / "livephoto").resolve()
+
+
+def _job_dir(job_id: str, *, create: bool = False) -> Path:
+    if not _JOB_ID_RE.fullmatch(job_id):
+        raise HTTPException(404, "任务不存在或已过期")
+    root = _livephoto_root()
+    directory = (root / job_id).resolve()
+    if directory.parent != root:
+        raise HTTPException(404, "任务不存在或已过期")
+    if create:
+        directory.mkdir(parents=True, exist_ok=True)
+    return directory
 
 
 def _sweep_expired() -> None:
-    now = time.time()
-    base = config.DATA_DIR / "livephoto"
+    base = _livephoto_root()
     if not base.exists():
         return
-    for d in base.iterdir():
-        if d.is_dir() and now - d.stat().st_mtime > config.JOB_TTL_SECONDS:
-            shutil.rmtree(d, ignore_errors=True)
-            _JOBS.pop(d.name, None)
+    now = time.time()
+    try:
+        entries = list(base.iterdir())
+    except OSError:
+        return
+    for directory in entries:
+        try:
+            if (
+                directory.is_dir()
+                and now - directory.stat().st_mtime > config.JOB_TTL_SECONDS
+            ):
+                shutil.rmtree(directory, ignore_errors=True)
+        except OSError:
+            continue
 
 
-def _parse_bool(v: str) -> bool:
-    return v.strip().lower() in ("1", "true", "yes", "on")
+def _read_meta(directory: Path) -> dict:
+    try:
+        return json.loads((directory / "meta.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def _parse_bool(value: str) -> bool:
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _safe_suffix(filename: str | None) -> str:
+    suffix = Path(filename or "").suffix.lower()
+    if re.fullmatch(r"\.[a-z0-9]{1,8}", suffix):
+        return suffix
+    return ".mp4"
 
 
 @router.post("/live-photo")
@@ -84,55 +112,98 @@ async def create_live_photo(
     except ValueError:
         raise HTTPException(400, "clip_start / audio_fade_secs 必须是数字")
 
+    mode: ffmpeg_plan.DurationMode = int(duration_mode)  # type: ignore[assignment]
+    try:
+        keyframe_f = (
+            float(keyframe_time)
+            if keyframe_time.strip()
+            else -1.0
+        )
+    except ValueError:
+        raise HTTPException(400, "keyframe_time 必须是数字")
+
+    identifier = content_identifier.strip()
+    if identifier and not _UUID_RE.fullmatch(identifier):
+        raise HTTPException(400, "content_identifier 必须是标准 UUID")
+
     job_id = uuid.uuid4().hex[:12]
-    d = _job_dir(job_id)
-    src = d / f"input_{Path(video.filename or 'video').suffix or '.mp4'}"
+    directory = _job_dir(job_id, create=True)
+    src = directory / f"input{_safe_suffix(video.filename)}"
 
     size = 0
-    with src.open("wb") as f:
-        while chunk := await video.read(1024 * 1024):
-            size += len(chunk)
-            if size > config.MAX_UPLOAD_MB * 1024 * 1024:
-                f.close()
-                shutil.rmtree(d, ignore_errors=True)
-                raise HTTPException(413, f"文件超过 {config.MAX_UPLOAD_MB}MB 上限")
-            f.write(chunk)
+    try:
+        with src.open("wb") as output:
+            while chunk := await video.read(1024 * 1024):
+                size += len(chunk)
+                if size > config.MAX_UPLOAD_MB * 1024 * 1024:
+                    raise HTTPException(
+                        413, f"文件超过 {config.MAX_UPLOAD_MB}MB 上限"
+                    )
+                output.write(chunk)
+    except Exception:
+        shutil.rmtree(directory, ignore_errors=True)
+        raise
+    if size == 0:
+        shutil.rmtree(directory, ignore_errors=True)
+        raise HTTPException(400, "上传的视频文件为空")
 
-    mode: ffmpeg_plan.DurationMode = int(duration_mode)  # type: ignore
-    kf = float(keyframe_time) if keyframe_time.strip() else mode / 2.0
     params = ffmpeg_plan.LivePhotoJobParams(
         duration_mode=mode,
         clip_start=clip_start_f,
-        keyframe_time=kf,
-        fallback=fallback,  # type: ignore
-        codec=codec,  # type: ignore
+        keyframe_time=keyframe_f,
+        fallback=fallback,  # type: ignore[arg-type]
+        codec=codec,  # type: ignore[arg-type]
         muted=_parse_bool(muted),
         audio_fade_secs=fade_f,
-        content_identifier=content_identifier.strip(),
+        content_identifier=identifier,
+        prefer_copy=True,
     )
 
     try:
-        result = await asyncio.to_thread(livephoto.run_livephoto_job, src, d, params)
-    except subprocess.CalledProcessError as e:
-        shutil.rmtree(d, ignore_errors=True)
-        raise HTTPException(500, f"FFmpeg 转码失败：{(e.stderr or '')[-500:]}")
-    except (ValueError, RuntimeError) as e:
-        shutil.rmtree(d, ignore_errors=True)
-        raise HTTPException(422, str(e))
+        result = await asyncio.to_thread(
+            livephoto.run_livephoto_job, src, directory, params
+        )
+    except subprocess.CalledProcessError as exc:
+        shutil.rmtree(directory, ignore_errors=True)
+        detail = (exc.stderr or "FFmpeg 处理失败").strip()[-800:]
+        raise HTTPException(422, f"视频处理失败：{detail}") from exc
+    except (ValueError, RuntimeError) as exc:
+        shutil.rmtree(directory, ignore_errors=True)
+        raise HTTPException(422, str(exc)) from exc
+    except Exception:
+        shutil.rmtree(directory, ignore_errors=True)
+        raise
+
+    src.unlink(missing_ok=True)
 
     meta = {
         "content_identifier": result.content_identifier,
+        "file_base_name": result.file_base_name,
         "export_duration": round(result.export_duration, 2),
-        "still_image_time": result.still_image_time,
+        "output_duration": round(result.output_duration, 2),
+        "still_image_time": round(result.still_image_time, 3),
+        "keyframe_offset": round(result.keyframe_offset, 2),
         "clip_start": round(result.clip_start, 2),
         "keyframe_time": round(result.keyframe_time, 2),
         "needs_fallback": result.needs_fallback,
         "fallback": result.fallback,
         "codec": codec,
         "muted": params.muted,
+        "video_action": result.video_action,
+        "audio_action": result.audio_action,
+        "no_reencode": (
+            result.video_action == "copy"
+            and result.audio_action in ("copy", "none")
+        ),
+        "source_video_codec": result.source_video_codec,
+        "source_pix_fmt": result.source_pix_fmt,
         "metadata_notes": result.metadata_notes,
+        "warnings": result.warnings,
     }
-    _JOBS[job_id] = {"dir": str(d), "meta": meta}
+    (directory / "meta.json").write_text(
+        json.dumps(meta, ensure_ascii=False), encoding="utf-8"
+    )
+
     return {
         "job_id": job_id,
         "still_url": f"/api/jobs/{job_id}/still.jpg",
@@ -144,24 +215,44 @@ async def create_live_photo(
 
 @router.get("/jobs/{job_id}/download")
 async def download_job(job_id: str):
-    d = _job_dir(job_id)
-    still, mov = d / "still.jpg", d / "live.mov"
+    directory = _job_dir(job_id)
+    still, mov = directory / "still.jpg", directory / "live.mov"
     if not (still.exists() and mov.exists()):
         raise HTTPException(404, "任务不存在或已过期")
-    zpath = d / "livephoto.zip"
-    with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as z:
-        z.write(still, "still.jpg")
-        z.write(mov, "live.mov")
-    return FileResponse(zpath, media_type="application/zip", filename="livephoto.zip")
+
+    base_name = str(_read_meta(directory).get("file_base_name") or "LivePhoto")
+    archive_path = directory / f"{base_name}.zip"
+    with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.write(still, f"{base_name}.JPG")
+        archive.write(mov, f"{base_name}.MOV")
+    return FileResponse(
+        archive_path,
+        media_type="application/zip",
+        filename=f"{base_name}.zip",
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @router.get("/jobs/{job_id}/{filename}")
 async def get_job_file(job_id: str, filename: str):
     if filename not in ("still.jpg", "live.mov"):
         raise HTTPException(404, "文件不存在")
-    d = _job_dir(job_id)
-    p = d / filename
-    if not p.exists():
+    path = _job_dir(job_id) / filename
+    if not path.exists():
         raise HTTPException(404, "任务不存在或已过期")
-    media = "image/jpeg" if filename == "still.jpg" else "video/quicktime"
-    return FileResponse(p, media_type=media, filename=filename)
+    media_type = "image/jpeg" if filename == "still.jpg" else "video/quicktime"
+    return FileResponse(
+        path,
+        media_type=media_type,
+        filename=filename,
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@router.delete("/jobs/{job_id}")
+async def delete_job(job_id: str):
+    directory = _job_dir(job_id)
+    if not directory.exists():
+        return {"ok": True}
+    shutil.rmtree(directory, ignore_errors=True)
+    return {"ok": True}

@@ -40,3 +40,7 @@ media-service/*.egg-info/
 # uploads / tmp
 tmp/
 uploads/
+.tmp-media/
+.runlogs/
+public/_test-*
+/*-first.png
