@@ -41,7 +41,7 @@ export function Header() {
 
         <div className="flex items-center gap-3">
           <a
-            href="https://github.com"
+            href="https://github.com/zhaysys-web/Livecraft"
             target="_blank"
             rel="noreferrer"
             aria-label="GitHub"

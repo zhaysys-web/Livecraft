@@ -16,7 +16,7 @@ cd livecraft
 git init
 git add .
 git commit -m "feat: direct save Live Photo with no-reencode fast path"
-git remote add origin https://github.com/<你的用户名>/livecraft.git
+git remote add origin https://github.com/zhaysys-web/Livecraft.git
 git branch -M main
 git push -u origin main
 ```

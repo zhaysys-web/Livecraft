@@ -26,7 +26,7 @@ import {
   type BarAction,
 } from "@/components/tools/mobile-action-bar";
 import { ServiceStatusPill } from "@/components/tools/service-status";
-import { WeChatTip } from "@/components/tools/wechat-tip";
+import { WeChatTip, isWeChatBrowser } from "@/components/tools/wechat-tip";
 import { useMediaService } from "@/hooks/use-media-service";
 import {
   deleteLivePhotoJob,
@@ -393,6 +393,12 @@ export default function LivePhotoPage() {
       );
       return;
     }
+    if (isWeChatBrowser()) {
+      setShareNotice(
+        "检测到微信内置浏览器：微信内不支持直接存入相册。请点击右上角「···」→「在浏览器打开」（如 Safari），即可一键保存为实况照片；或使用下方 ZIP 兜底。",
+      );
+      return;
+    }
     if (typeof nav.share !== "function") {
       setShareNotice("当前浏览器不支持系统分享，请使用 ZIP 兜底。");
       return;
@@ -490,6 +496,11 @@ export default function LivePhotoPage() {
           </span>
         </h1>
         <ServiceStatusPill />
+      </div>
+
+      {/* 微信内置浏览器提示 */}
+      <div className="mt-4">
+        <WeChatTip />
       </div>
 
       {/* 步骤条 */}
