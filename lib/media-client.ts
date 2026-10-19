@@ -148,7 +148,7 @@ export async function fetchWithTimeout(
 export async function livePhotoConvert(
   video: File,
   p: LivePhotoParams,
-  onUploadProgress?: (loaded: number, total: number) => void,
+  onUploadProgress?: (percent: number, loaded: number, total: number) => void,
 ): Promise<LivePhotoResult> {
   const fd = new FormData();
   fd.append("video", video);
@@ -160,30 +160,55 @@ export async function livePhotoConvert(
   fd.append("muted", String(p.muted));
   fd.append("audio_fade_secs", String(p.audioFadeSecs ?? 0.2));
   if (p.contentIdentifier) fd.append("content_identifier", p.contentIdentifier);
-  // 转码在服务端同步执行，超时设为 10 分钟；上传进度用 XHR（fetch 不支持）
-  const res = onUploadProgress
-    ? await xhrPost(`${mediaBase()}/api/live-photo`, fd, onUploadProgress, 600000)
-    : await fetchWithTimeout(
-        `${mediaBase()}/api/live-photo`,
-        { method: "POST", body: fd },
-        600000,
-      );
-  if (!res.ok) {
-    const text = await res.text();
-    let detail = text;
-    try {
-      const body = JSON.parse(text) as { detail?: string; message?: string };
-      detail = body.detail ?? body.message ?? text;
-    } catch {
-      // Keep the raw response when the server did not return JSON.
+
+  return new Promise<LivePhotoResult>((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    const url = `${mediaBase()}/api/live-photo`;
+    xhr.open("POST", url);
+    xhr.timeout = 600000;
+
+    if (xhr.upload && onUploadProgress) {
+      xhr.upload.onprogress = (event) => {
+        if (event.lengthComputable && event.total > 0) {
+          const percent = Math.round((event.loaded / event.total) * 100);
+          onUploadProgress(percent, event.loaded, event.total);
+        }
+      };
     }
-    throw new Error(`生成失败（${res.status}）：${detail}`);
-  }
-  const body = (await res.json()) as LivePhotoResult;
-  body.still_url = abs(body.still_url);
-  body.mov_url = abs(body.mov_url);
-  body.download_url = abs(body.download_url);
-  return body;
+
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        try {
+          const body = JSON.parse(xhr.responseText) as LivePhotoResult;
+          body.still_url = abs(body.still_url);
+          body.mov_url = abs(body.mov_url);
+          body.download_url = abs(body.download_url);
+          resolve(body);
+        } catch {
+          reject(new Error("解析服务端返回数据失败"));
+        }
+      } else {
+        let detail = xhr.responseText;
+        try {
+          const body = JSON.parse(xhr.responseText) as { detail?: string; message?: string };
+          detail = body.detail ?? body.message ?? xhr.responseText;
+        } catch {
+          // Keep raw
+        }
+        reject(new Error(`生成失败（${xhr.status}）：${detail}`));
+      }
+    };
+
+    xhr.onerror = () => {
+      reject(new Error("网络请求失败，请检查网络连接或后端媒体服务"));
+    };
+
+    xhr.ontimeout = () => {
+      reject(new Error("请求超时（600 秒），媒体服务处理超时或正在冷启动"));
+    };
+
+    xhr.send(fd);
+  });
 }
 
 export async function deleteLivePhotoJob(jobId: string): Promise<void> {
