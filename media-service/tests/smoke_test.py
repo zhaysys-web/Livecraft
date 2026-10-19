@@ -110,6 +110,23 @@ def main() -> int:
     check("jpg MakerNote 是标准 TIFF（magic=42, tag=17, ASCII）",
           _magic == 42 and _tag == 17 and _typ == 2 and _cnt == 37,
           f"magic={_magic} tag={_tag} type={_typ} count={_cnt}")
+    # 文件对整体校验（模拟 iOS 配对逻辑）
+    _pair_problems = metadata.validate_live_photo_pair(r.still_path, r.mov_path)
+    check("文件对通过 Live Photo 配对校验", not _pair_problems,
+          "; ".join(_pair_problems) if _pair_problems else "")
+    # 反例：旧的坏格式必须被校验器拦下
+    import piexif as _piexif
+    _bad = _piexif.load(r.still_path.read_bytes())
+    _bad["Exif"][_piexif.ExifIFD.MakerNote] = (
+        bytes.fromhex("4170706c6520694f530000014d4d000100110002000000250000002000000000")
+        + b"11111111-2222-3333-4444-555555555555\x00"
+    )
+    _bad_path = tmp / "bad.jpg"
+    _bad_path.write_bytes(r.still_path.read_bytes())
+    _piexif.insert(_piexif.dump(_bad), str(_bad_path))
+    _bad_problems = metadata.validate_live_photo_pair(_bad_path, r.mov_path)
+    check("校验器能识别旧坏格式（魔数错误）", any("魔数" in p for p in _bad_problems),
+          "; ".join(_bad_problems) if _bad_problems else "未检出问题")
     live_meta = livephoto_mov.read_apple_metadata(r.mov_path)
     check("still-image-time 写入时间轨且使用片段内相对时间",
           abs(live_meta.still_time - 1.5) < 0.01
