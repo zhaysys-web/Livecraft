@@ -9,7 +9,8 @@ services:
     name: livecraft-media
     runtime: docker
     dockerfilePath: ./media-service/Dockerfile
-    dockerContext: .
+    # 构建上下文设为 media-service 目录，与 Dockerfile 内的 COPY 路径对应
+    dockerContext: ./media-service
     plan: free
     healthCheckPath: /api/health
     envVars:
