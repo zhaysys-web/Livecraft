@@ -57,6 +57,8 @@ def _prepare_params(
     params.source_video_codec = str(info["video_codec"])
     params.source_audio_codec = str(info["audio_codec"])
     params.source_pix_fmt = str(info["pix_fmt"])
+    params.source_width = float(info.get("width") or 0)
+    params.source_height = float(info.get("height") or 0)
     params.content_identifier = (
         params.content_identifier.strip() or str(uuid.uuid4())
     ).upper()

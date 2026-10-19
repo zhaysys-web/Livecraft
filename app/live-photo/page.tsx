@@ -26,7 +26,7 @@ import {
   type BarAction,
 } from "@/components/tools/mobile-action-bar";
 import { ServiceStatusPill } from "@/components/tools/service-status";
-import { WeChatTip, isWeChatBrowser } from "@/components/tools/wechat-tip";
+import { WeChatTip } from "@/components/tools/wechat-tip";
 import { useMediaService } from "@/hooks/use-media-service";
 import {
   deleteLivePhotoJob,
@@ -122,6 +122,11 @@ export default function LivePhotoPage() {
   >("idle");
   const [shareError, setShareError] = useState<string | null>(null);
   const [shareNotice, setShareNotice] = useState<string | null>(null);
+  /** 相册文件下载进度（字节）；total 为 null 时只显示已下载量 */
+  const [shareProgress, setShareProgress] = useState<{
+    loaded: number;
+    total: number | null;
+  } | null>(null);
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const serviceStatus = useMediaService();
@@ -322,6 +327,7 @@ export default function LivePhotoPage() {
       setShareSupported(false);
       setShareState("idle");
       setShareError(null);
+      setShareProgress(null);
       return;
     }
 
@@ -330,19 +336,51 @@ export default function LivePhotoPage() {
     setShareError(null);
     setShareSupported(false);
     setShareNotice(null);
+    setShareProgress({ loaded: 0, total: null });
+
+    /** 流式下载并上报进度（无 Content-Length 时只显示已下载量） */
+    const fetchBlobWithProgress = async (
+      url: string,
+      key: "still" | "mov",
+      tracker: Record<"still" | "mov", { loaded: number; total: number | null }>,
+    ): Promise<Blob> => {
+      const res = await fetch(url, {
+        cache: "no-store",
+        signal: controller.signal,
+      });
+      if (!res.ok || !res.body) throw new Error("生成文件暂时无法读取");
+      const total = Number(res.headers.get("content-length")) || null;
+      tracker[key] = { loaded: 0, total };
+      const reader = res.body.getReader();
+      const chunks: BlobPart[] = [];
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (controller.signal.aborted) throw new DOMException("aborted", "AbortError");
+        chunks.push(value);
+        tracker[key].loaded += value.byteLength;
+        const loaded = tracker.still.loaded + tracker.mov.loaded;
+        const t = tracker.still.total;
+        const t2 = tracker.mov.total;
+        setShareProgress({
+          loaded,
+          total: t != null && t2 != null ? t + t2 : null,
+        });
+      }
+      return new Blob(chunks, {
+        type: res.headers.get("content-type") ?? undefined,
+      });
+    };
 
     const prepare = async () => {
       try {
-        const [stillResponse, movResponse] = await Promise.all([
-          fetch(realResult.still_url, { cache: "no-store", signal: controller.signal }),
-          fetch(realResult.mov_url, { cache: "no-store", signal: controller.signal }),
-        ]);
-        if (!stillResponse.ok || !movResponse.ok) {
-          throw new Error("生成文件暂时无法读取");
-        }
+        const tracker = {
+          still: { loaded: 0, total: null as number | null },
+          mov: { loaded: 0, total: null as number | null },
+        };
         const [stillBlob, movBlob] = await Promise.all([
-          stillResponse.blob(),
-          movResponse.blob(),
+          fetchBlobWithProgress(realResult.still_url, "still", tracker),
+          fetchBlobWithProgress(realResult.mov_url, "mov", tracker),
         ]);
         if (!stillBlob.size || !movBlob.size) {
           throw new Error("生成文件为空");
@@ -364,9 +402,11 @@ export default function LivePhotoPage() {
         setShareFiles(files);
         setShareSupported(supportsFileShare(files));
         setShareState("ready");
+        setShareProgress(null);
       } catch (error) {
         if (controller.signal.aborted) return;
         setShareState("error");
+        setShareProgress(null);
         setShareError(
           error instanceof Error ? error.message : "相册文件准备失败",
         );
@@ -390,12 +430,6 @@ export default function LivePhotoPage() {
         shareError
           ? `相册文件准备失败：${shareError}。请使用 ZIP 兜底。`
           : "相册文件尚未准备好，请使用 ZIP 兜底。",
-      );
-      return;
-    }
-    if (isWeChatBrowser()) {
-      setShareNotice(
-        "检测到微信内置浏览器：微信内不支持直接存入相册。请点击右上角「···」→「在浏览器打开」（如 Safari），即可一键保存为实况照片；或使用下方 ZIP 兜底。",
       );
       return;
     }
@@ -496,11 +530,6 @@ export default function LivePhotoPage() {
           </span>
         </h1>
         <ServiceStatusPill />
-      </div>
-
-      {/* 微信内置浏览器提示 */}
-      <div className="mt-4">
-        <WeChatTip />
       </div>
 
       {/* 步骤条 */}
@@ -916,13 +945,37 @@ export default function LivePhotoPage() {
                     <div className="space-y-3 pt-2">
                       <WeChatTip />
                       {shareState === "loading" ? (
-                        <button
-                          disabled
-                          className="btn-primary flex w-full items-center justify-center gap-2 opacity-70"
-                        >
-                          <Loader2 className="h-4 w-4 animate-spin" />
-                          正在准备相册文件…
-                        </button>
+                        <div className="space-y-2.5">
+                          <button
+                            disabled
+                            className="btn-primary flex w-full items-center justify-center gap-2 opacity-70"
+                          >
+                            <Loader2 className="h-4 w-4 animate-spin" />
+                            正在准备相册文件…
+                          </button>
+                          {shareProgress && (
+                            <div>
+                              <div className="h-1.5 overflow-hidden rounded-full bg-white/10">
+                                <div
+                                  className="h-full rounded-full bg-gradient-to-r from-aurora-violet to-aurora-cyan transition-[width] duration-200"
+                                  style={{
+                                    width:
+                                      shareProgress.total != null &&
+                                      shareProgress.total > 0
+                                        ? `${Math.min(100, (shareProgress.loaded / shareProgress.total) * 100).toFixed(1)}%`
+                                        : "100%",
+                                  }}
+                                />
+                              </div>
+                              <p className="mt-1.5 text-center text-[11px] text-white/40">
+                                {shareProgress.total != null &&
+                                shareProgress.total > 0
+                                  ? `已下载 ${(shareProgress.loaded / 1048576).toFixed(1)} / ${(shareProgress.total / 1048576).toFixed(1)} MB（${Math.min(100, (shareProgress.loaded / shareProgress.total) * 100).toFixed(0)}%）`
+                                  : `已下载 ${(shareProgress.loaded / 1048576).toFixed(1)} MB…`}
+                              </p>
+                            </div>
+                          )}
+                        </div>
                       ) : (
                         <button
                           onClick={saveToPhotos}

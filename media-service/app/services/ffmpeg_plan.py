@@ -55,6 +55,8 @@ class LivePhotoJobParams:
     source_video_codec: str = ""
     source_audio_codec: str = ""
     source_pix_fmt: str = ""
+    source_width: float = 0.0
+    source_height: float = 0.0
 
 
 @dataclass
@@ -221,6 +223,7 @@ def _build_encode_command(
     mov_out: Path,
     duration: float,
     keyframe_offset: float,
+    needs_downscale: bool = False,
 ) -> list[str]:
     fps = max(1, int(round(min(60.0, p.source_fps or 30.0))))
     vcodec = _VCODEC[p.codec]
@@ -231,10 +234,16 @@ def _build_encode_command(
     seg = p.video_duration if force_reencode_short else float(p.duration_mode)
     start = 0.0 if short else p.clip_start
 
+    # 降采样：只在需要时加 scale 滤镜（ih <= 上限时为 no-op）
+    scale_filter = ""
+    if needs_downscale:
+        max_h = config.MAX_OUTPUT_HEIGHT
+        scale_filter = f",scale=-2:'min(ih,{max_h})'"
+
     if not force_reencode_short:
         v_filter = (
             f"[0:v]trim=start={f2(start)}:duration={f2(duration)},"
-            f"setpts=PTS-STARTPTS,fps={fps},settb=AVTB[v]"
+            f"setpts=PTS-STARTPTS,fps={fps},settb=AVTB{scale_filter}[v]"
         )
         a_filter = (
             f"[0:a]atrim=start={f2(start)}:duration={f2(duration)},"
@@ -246,7 +255,7 @@ def _build_encode_command(
         v_filter = (
             f"[0:v]trim=start=0:duration={f2(seg)},setpts=PTS-STARTPTS,fps={fps},"
             f"split[a][b];[b]reverse[r];[a][r]concat=n=2:v=1:a=0,"
-            f"loop=loop=-1:size={pair_frames},trim=duration={f2(duration)},settb=AVTB[v]"
+            f"loop=loop=-1:size={pair_frames},trim=duration={f2(duration)},settb=AVTB{scale_filter}[v]"
         )
         pair_samples = max(2, round(seg * 48000) * 2)
         a_filter = (
@@ -266,7 +275,7 @@ def _build_encode_command(
         tempos.append(f"atempo={tempo:.4f}")
         v_filter = (
             f"[0:v]trim=start=0:duration={f2(seg)},setpts={stretch:.4f}*PTS,"
-            f"fps={fps},settb=AVTB[v]"
+            f"fps={fps},settb=AVTB{scale_filter}[v]"
         )
         a_filter = (
             f"[0:a]atrim=start=0:duration={f2(seg)},asetpts=PTS-STARTPTS,"
@@ -328,6 +337,13 @@ def build_plan(
         else "reencode"
     )
 
+    # 压小文件：源分辨率超过上限时强制重编码并降采样，减小 MOV 体积、加快下载。
+    # 实况照片在相册内观看，1080p 已足够；4K 源不降采样会导致几十 MB 的下载。
+    max_h = config.MAX_OUTPUT_HEIGHT
+    needs_downscale = max_h > 0 and p.source_height > max_h
+    if needs_downscale and video_action == "copy":
+        video_action = "reencode"
+
     if p.muted or not p.source_has_audio:
         audio_action = "none"
     elif video_action == "copy" and p.source_audio_codec in QUICKTIME_COPYABLE_AUDIO:
@@ -348,7 +364,7 @@ def build_plan(
         )
     else:
         video_cmd = _build_encode_command(
-            p, src, mov_out, duration, keyframe_offset
+            p, src, mov_out, duration, keyframe_offset, needs_downscale
         )
 
     still_cmd = build_still_command(src, still_out, p.keyframe_time)
@@ -360,10 +376,17 @@ def build_plan(
             f"音频：{'原样复制' if audio_action == 'copy' else ('转码为 AAC' if audio_action == 'reencode' else '无音轨 / 已静音')}",
         ]
     else:
-        warnings.append(
-            "源视频编码不兼容快速封装，或需要正倒放/慢放补帧；本次已转为兼容格式。"
-        )
-        notes = ["视频：已兼容转码（源文件不适合直接装入 QuickTime）"]
+        if needs_downscale:
+            warnings.append(
+                f"源视频为 {int(p.source_width)}x{int(p.source_height)}，已降采样至 "
+                f"{config.MAX_OUTPUT_HEIGHT}p 以减小文件体积、加快下载；画质在相册内观看无可感知差异。"
+            )
+            notes = ["视频：已降采样转码（源分辨率过高，直存下载太慢）"]
+        else:
+            warnings.append(
+                "源视频编码不兼容快速封装，或需要正倒放/慢放补帧；本次已转为兼容格式。"
+            )
+            notes = ["视频：已兼容转码（源文件不适合直接装入 QuickTime）"]
         if audio_action == "reencode":
             notes.append("音频：已转码为 AAC")
         elif audio_action == "none":

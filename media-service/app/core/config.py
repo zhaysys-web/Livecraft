@@ -25,6 +25,9 @@ JOB_TTL_SECONDS = _env_int("JOB_TTL_SECONDS", 86400)
 MAX_UPLOAD_MB = _env_int("MAX_UPLOAD_MB", 500)
 # 单个视频时长上限（秒），ffprobe 探测后强制执行
 MAX_VIDEO_DURATION_SECS = _env_int("MAX_VIDEO_DURATION_SECS", 600)
+# 输出视频高度上限（像素）：源视频更高时降采样到该高度，减小文件体积、加快下载；
+# 设为 0 则关闭。实况照片在相册内观看，1080p 已足够。
+MAX_OUTPUT_HEIGHT = _env_int("MAX_OUTPUT_HEIGHT", 1080)
 
 # ---- 公网安全加固 ----
 # 通用 API 限流（次/分钟/IP）
