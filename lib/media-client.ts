@@ -10,7 +10,8 @@ const BASE =
 export interface LivePhotoParams {
   durationMode: 3 | 5;
   clipStart: number;
-  keyframeTime: number;
+  /** 封面帧时间戳（秒）；传 null 时后端自动取片段中点 */
+  keyframeTime: number | null;
   fallback: "pingpong" | "slowdown" | "keep";
   codec: "h264" | "hevc";
   muted: boolean;
@@ -57,7 +58,7 @@ export async function livePhotoConvert(
   fd.append("video", video);
   fd.append("duration_mode", String(p.durationMode));
   fd.append("clip_start", String(p.clipStart));
-  fd.append("keyframe_time", String(p.keyframeTime));
+  fd.append("keyframe_time", p.keyframeTime == null ? "" : String(p.keyframeTime));
   fd.append("fallback", p.fallback);
   fd.append("codec", p.codec);
   fd.append("muted", String(p.muted));

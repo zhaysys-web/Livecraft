@@ -6,13 +6,16 @@ import { AnimatePresence, motion } from "framer-motion";
 import {
   ArrowLeft,
   Check,
+  ChevronDown,
   Download,
   FileImage,
   Film,
   RotateCcw,
+  Scissors,
   Volume2,
   VolumeX,
   AlertCircle,
+  RefreshCw,
 } from "lucide-react";
 import { Dropzone } from "@/components/tools/dropzone";
 import { SegmentedControl } from "@/components/tools/segmented-control";
@@ -23,33 +26,25 @@ import {
 } from "@/components/tools/mobile-action-bar";
 import { ServiceStatusPill } from "@/components/tools/service-status";
 import { useMediaService } from "@/hooks/use-media-service";
-import {
-  livePhotoConvert,
-  type LivePhotoResult,
-} from "@/lib/media-client";
+import { livePhotoConvert, type LivePhotoResult, type LivePhotoParams } from "@/lib/media-client";
 import {
   DURATION_MODES,
   FALLBACKS,
   FALLBACK_LABEL,
-  buildFfmpegArgs,
   effectiveWindow,
-  exportDuration,
   formatClock,
-  needsFallback,
   newContentIdentifier,
   type DurationMode,
   type FallbackStrategy,
-  type LivePhotoJobParams,
   type VideoCodec,
 } from "@/lib/livephoto";
 import { cn } from "@/lib/utils";
 
-type Step = "upload" | "clip" | "options" | "working" | "done";
+type Step = "upload" | "ready" | "working" | "done";
 
 const STEPS: { id: Step; label: string }[] = [
   { id: "upload", label: "上传视频" },
-  { id: "clip", label: "裁剪片段" },
-  { id: "options", label: "转码设置" },
+  { id: "ready", label: "一键生成" },
   { id: "done", label: "完成" },
 ];
 
@@ -69,22 +64,29 @@ const REAL_STAGES = [
   "打包完成，准备下载…",
 ];
 
+/** 高级裁剪里视频解码超时（毫秒）：超时只提示，不阻塞生成 */
+const DECODE_TIMEOUT_MS = 15000;
+
 export default function LivePhotoPage() {
   const [step, setStep] = useState<Step>("upload");
   const [videoFile, setVideoFile] = useState<File | null>(null);
   const [videoUrl, setVideoUrl] = useState<string | null>(null);
   const [videoName, setVideoName] = useState("");
-  const [videoDuration, setVideoDuration] = useState(0);
 
+  // 一键生成的默认参数（无需解码，后端自动探测时长）
   const [durationMode, setDurationMode] = useState<DurationMode>(3);
-  const [clipStart, setClipStart] = useState(0);
-  const [keyframe, setKeyframe] = useState(0);
-  const [fallback, setFallback] = useState<FallbackStrategy>("pingpong");
-
   const [codec, setCodec] = useState<VideoCodec>("h264");
   const [muted, setMuted] = useState(true);
+  const [fallback, setFallback] = useState<FallbackStrategy>("pingpong");
+
+  // 高级：自定义截取片段（需要浏览器解码预览，失败不阻塞）
+  const [customClip, setCustomClip] = useState(false);
+  const [videoDuration, setVideoDuration] = useState(0);
+  const [clipStart, setClipStart] = useState(0);
+  const [keyframe, setKeyframe] = useState(0);
+  const [decodeError, setDecodeError] = useState<string | null>(null);
+
   const [stageIdx, setStageIdx] = useState(0);
-  const [jobParams, setJobParams] = useState<LivePhotoJobParams | null>(null);
 
   // 真实任务状态
   const [realResult, setRealResult] = useState<LivePhotoResult | null>(null);
@@ -97,7 +99,6 @@ export default function LivePhotoPage() {
   const online = serviceStatus === "online";
 
   const win = effectiveWindow(videoDuration, durationMode);
-  const short = needsFallback(videoDuration, durationMode);
 
   // 切换 / 卸载时释放对象 URL
   useEffect(() => {
@@ -118,38 +119,58 @@ export default function LivePhotoPage() {
     setVideoFile(f);
     setVideoUrl(URL.createObjectURL(f));
     setVideoName(f.name);
+    // 重置高级裁剪状态
+    setCustomClip(false);
     setVideoDuration(0);
     setClipStart(0);
     setKeyframe(0);
-    setJobParams(null);
+    setDecodeError(null);
     setRealResult(null);
     setJobError(null);
-    setStep("clip");
+    setStep("ready");
   };
 
   const reset = () => {
     setVideoFile(null);
     setVideoUrl(null);
     setVideoName("");
+    setCustomClip(false);
     setVideoDuration(0);
     setClipStart(0);
     setKeyframe(0);
+    setDecodeError(null);
     setStageIdx(0);
-    setJobParams(null);
     setRealResult(null);
     setJobError(null);
     setStep("upload");
   };
 
-  /** 视频元数据就绪：初始化窗口与封面帧（片段中点） */
+  /** 高级裁剪：视频元数据就绪（仅在展开自定义片段时触发） */
   const handleLoadedMetadata = () => {
     const v = videoRef.current;
-    if (!v || !isFinite(v.duration)) return;
+    if (!v || !isFinite(v.duration) || v.duration <= 0) {
+      setDecodeError("无法读取该视频时长，仍可直接生成。");
+      return;
+    }
     const d = v.duration;
+    setDecodeError(null);
     setVideoDuration(d);
     setClipStart(0);
-    setKeyframe(effectiveWindow(d, durationMode) / 2);
+    setKeyframe(Math.round((effectiveWindow(d, durationMode) / 2) * 100) / 100);
   };
+
+  /** 高级裁剪：解码超时保护——只提示，绝不卡死 */
+  useEffect(() => {
+    if (!customClip) return;
+    setDecodeError(null);
+    const t = window.setTimeout(() => {
+      const d = videoRef.current?.duration;
+      if (!d || !isFinite(d)) {
+        setDecodeError("视频解码超时，无法预览片段；不影响一键生成。");
+      }
+    }, DECODE_TIMEOUT_MS);
+    return () => window.clearTimeout(t);
+  }, [customClip, videoUrl]);
 
   /** 切换 3s / 5s：窗口宽度联动，封面帧保持相对位置 */
   const changeMode = (m: DurationMode) => {
@@ -174,38 +195,25 @@ export default function LivePhotoPage() {
       Math.round(Math.min(Math.max(k + delta, s), s + win) * 100) / 100,
     );
     const v = videoRef.current;
-    if (v && step === "clip") v.currentTime = s;
-  };
-
-  /** 预览播放器：在选中区间内循环 */
-  const handleTimeUpdate = () => {
-    const v = videoRef.current;
-    if (!v || step !== "clip") return;
-    const end = clipStart + win;
-    if (v.currentTime >= end - 0.04) v.currentTime = clipStart;
-  };
-
-  // 进入裁剪步骤：从窗口起点自动播放预览
-  useEffect(() => {
-    const v = videoRef.current;
-    if (v && step === "clip" && videoDuration > 0) {
-      v.currentTime = clipStart;
-      v.play().catch(() => {});
+    if (v && isFinite(v.duration)) {
+      try {
+        v.currentTime = s;
+      } catch {
+        /* 忽略 seek 失败 */
+      }
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [step]);
+  };
 
-  const buildParams = (cid: string): LivePhotoJobParams => ({
+  const buildParams = (): LivePhotoParams => ({
     durationMode,
-    clipStart: short ? 0 : clipStart,
-    keyframeTime: short ? Math.min(keyframe, videoDuration) : keyframe,
+    clipStart: customClip ? clipStart : 0,
+    // 未自定义时传 null，后端自动取片段中点
+    keyframeTime: customClip ? keyframe : null,
     fallback,
     codec,
     muted,
     audioFadeSecs: 0.2,
-    targetFps: 60,
-    contentIdentifier: cid,
-    videoDuration,
+    contentIdentifier: newContentIdentifier(),
   });
 
   /** 真实转码任务 */
@@ -213,15 +221,12 @@ export default function LivePhotoPage() {
     if (jobRunning.current || !videoFile) return;
     jobRunning.current = true;
     try {
-      const r = await livePhotoConvert(
-        videoFile,
-        buildParams(newContentIdentifier()),
-      );
+      const r = await livePhotoConvert(videoFile, buildParams());
       setRealResult(r);
       setStep("done");
     } catch (e) {
       setJobError(e instanceof Error ? e.message : "转码失败，请重试");
-      setStep("options");
+      setStep("ready");
     } finally {
       jobRunning.current = false;
     }
@@ -263,46 +268,14 @@ export default function LivePhotoPage() {
     REAL_STAGES[Math.min(Math.floor(elapsed / 6), REAL_STAGES.length - 1)];
 
   const actions: BarAction[] = [];
-  if (step === "upload") {
-    actions.push({
-      label: videoUrl ? "下一步：裁剪片段" : "请先选择视频",
-      primary: true,
-      disabled: !videoUrl,
-      onClick: () => setStep("clip"),
-    });
-  } else if (step === "clip") {
-    actions.push({ label: "上一步", onClick: () => setStep("upload") });
-    actions.push({
-      label: "下一步：转码设置",
-      primary: true,
-      disabled: videoDuration <= 0,
-      onClick: () => setStep("options"),
-    });
-  } else if (step === "options") {
-    actions.push({ label: "上一步", onClick: () => setStep("clip") });
+  if (step === "ready") {
+    actions.push({ label: "重新选择", onClick: () => setStep("upload") });
     actions.push({ label: "开始生成", primary: true, onClick: generate });
   } else if (step === "done") {
     actions.push({ label: "再做一个", primary: true, onClick: reset });
   }
 
-  // 参数摘要（转码设置页）与 FFmpeg 预览共用
-  const previewParams: LivePhotoJobParams | null =
-    step === "options" || step === "done"
-      ? (jobParams ?? {
-          durationMode,
-          clipStart: short ? 0 : clipStart,
-          keyframeTime: keyframe,
-          fallback,
-          codec,
-          muted,
-          audioFadeSecs: 0.2,
-          targetFps: 60,
-          contentIdentifier: "UUID-将在生成时创建",
-          videoDuration,
-        })
-      : null;
-  const plan = previewParams ? buildFfmpegArgs(previewParams) : null;
-  const exportSecs = previewParams ? exportDuration(previewParams) : 0;
+  const sizeMB = videoFile ? (videoFile.size / 1048576).toFixed(1) : "0";
 
   return (
     <div className="mx-auto max-w-4xl px-5 pb-28 pt-10 sm:px-8 md:pb-16">
@@ -380,120 +353,7 @@ export default function LivePhotoPage() {
               />
             )}
 
-            {step === "clip" && videoUrl && (
-              <div className="space-y-5">
-                {!online && (
-                  <p className="rounded-2xl border border-white/10 bg-white/[0.02] px-4 py-3 text-center text-xs text-white/40">
-                    媒体服务未连接，当前为演示流程；启动 media-service 后将调用真实转码
-                  </p>
-                )}
-
-                {/* 时长模式 */}
-                <SegmentedControl
-                  id="clip-duration"
-                  options={DURATION_MODES}
-                  value={durationMode}
-                  onChange={changeMode}
-                />
-
-                {/* 预览播放器（区间循环） */}
-                <div className="glass shadow-card rounded-3xl p-5 sm:p-6">
-                  <div className="overflow-hidden rounded-2xl border border-white/10 bg-black">
-                    <video
-                      ref={videoRef}
-                      src={videoUrl}
-                      muted
-                      playsInline
-                      preload="auto"
-                      onLoadedMetadata={handleLoadedMetadata}
-                      onTimeUpdate={handleTimeUpdate}
-                      className="block max-h-[42vh] w-full object-contain"
-                    />
-                  </div>
-                  <p className="mt-3 text-center text-xs text-white/40">
-                    预览循环播放当前选中区间（{formatClock(clipStart)} –{" "}
-                    {formatClock(clipStart + win)}）
-                  </p>
-
-                  {/* 定长滑动裁剪 */}
-                  <div className="mt-4">
-                    <RangeTimeline
-                      duration={videoDuration}
-                      windowSecs={durationMode}
-                      start={clipStart}
-                      keyframe={keyframe}
-                      onStartChange={handleStartChange}
-                      onKeyframeChange={(t) =>
-                        setKeyframe(Math.round(t * 100) / 100)
-                      }
-                    />
-                  </div>
-
-                  {/* 封面帧 */}
-                  <div className="mt-4 flex flex-wrap items-center gap-3">
-                    <span className="chip !border-amber-300/30 !bg-amber-300/[0.08] !text-amber-200">
-                      封面帧 @ {keyframe.toFixed(2)}s
-                    </span>
-                    <button
-                      onClick={() =>
-                        setKeyframe(
-                          Math.round((clipStart + win / 2) * 100) / 100,
-                        )
-                      }
-                      className="text-xs text-white/45 underline-offset-4 hover:text-white hover:underline"
-                    >
-                      重置到片段中点
-                    </button>
-                    <span className="text-[11px] text-white/30">
-                      将写入 still-image-time 元数据
-                    </span>
-                  </div>
-                </div>
-
-                {/* 时长不足兜底 */}
-                {short ? (
-                  <div className="rounded-3xl border border-amber-300/25 bg-amber-300/[0.05] p-5 sm:p-6">
-                    <p className="text-sm text-amber-200">
-                      视频仅 {videoDuration.toFixed(1)}s，短于 {durationMode}s
-                      目标，请选择补齐方式：
-                    </p>
-                    <div className="mt-4 grid gap-2.5 sm:grid-cols-3">
-                      {FALLBACKS.map((f) => (
-                        <button
-                          key={f.value}
-                          onClick={() => setFallback(f.value)}
-                          className={cn(
-                            "rounded-2xl border p-4 text-left transition-all duration-200",
-                            fallback === f.value
-                              ? "border-amber-300/60 bg-amber-300/[0.08]"
-                              : "border-white/10 bg-white/[0.02] hover:border-white/25",
-                          )}
-                        >
-                          <span className="text-sm font-semibold text-white">
-                            {f.label}
-                          </span>
-                          <span className="ml-1.5 text-[11px] text-white/35">
-                            {f.en}
-                          </span>
-                          <span className="mt-1.5 block text-xs leading-relaxed text-white/45">
-                            {f.desc}
-                          </span>
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-                ) : (
-                  videoDuration > 0 && (
-                    <p className="rounded-2xl border border-white/10 bg-white/[0.02] px-4 py-3 text-center text-xs text-white/40">
-                      视频 {videoDuration.toFixed(1)}s ≥ {durationMode}s，拖动窗口选取最精彩的{" "}
-                      {durationMode}s 片段
-                    </p>
-                  )
-                )}
-              </div>
-            )}
-
-            {step === "options" && previewParams && (
+            {step === "ready" && videoFile && (
               <div className="space-y-5">
                 {jobError && (
                   <div className="flex items-start gap-2.5 rounded-2xl border border-red-500/30 bg-red-500/10 px-4 py-3.5 text-sm text-red-200">
@@ -502,167 +362,225 @@ export default function LivePhotoPage() {
                   </div>
                 )}
 
-                <SegmentedControl
-                  id="opt-duration"
-                  options={DURATION_MODES}
-                  value={durationMode}
-                  onChange={changeMode}
-                />
+                {!online && (
+                  <p className="rounded-2xl border border-white/10 bg-white/[0.02] px-4 py-3 text-center text-xs text-white/40">
+                    媒体服务未连接，当前为演示流程；后端上线后将调用真实转码
+                  </p>
+                )}
 
-                <div className="glass shadow-card rounded-3xl p-6 sm:p-8">
-                  <h2 className="font-display text-lg font-semibold">
-                    转码设置
-                  </h2>
-
-                  <div className="mt-6">
-                    <label className="mb-2.5 block text-sm text-white/70">
-                      编码格式
-                    </label>
-                    <div className="grid grid-cols-2 gap-3">
-                      {(
-                        [
-                          { id: "h264", label: "H.264", desc: "兼容性最好" },
-                          { id: "hevc", label: "HEVC", desc: "体积更小" },
-                        ] as const
-                      ).map((c) => (
-                        <button
-                          key={c.id}
-                          onClick={() => setCodec(c.id)}
-                          className={cn(
-                            "rounded-2xl border p-4 text-left transition-all duration-200",
-                            codec === c.id
-                              ? "border-aurora-violet/60 bg-aurora-violet/[0.08] shadow-glow-violet"
-                              : "border-white/10 bg-white/[0.02] hover:border-white/25",
-                          )}
-                        >
-                          <span className="block text-sm font-semibold text-white">
-                            {c.label}
-                          </span>
-                          <span className="mt-1 block text-xs text-white/40">
-                            {c.desc}
-                          </span>
-                        </button>
-                      ))}
-                    </div>
+                {/* 文件卡片 */}
+                <div className="glass shadow-card flex items-center gap-4 rounded-3xl p-5">
+                  <span className="grid h-12 w-12 shrink-0 place-items-center rounded-2xl bg-gradient-to-br from-aurora-violet/25 to-aurora-cyan/25">
+                    <Film className="h-6 w-6 text-white" />
+                  </span>
+                  <div className="min-w-0 flex-1">
+                    <p className="truncate text-sm font-medium text-white">
+                      {videoName}
+                    </p>
+                    <p className="mt-1 text-xs text-white/40">
+                      {sizeMB} MB · 默认从开头截取 {durationMode}s，封面帧自动取中点
+                    </p>
                   </div>
-
                   <button
-                    onClick={() => setMuted((m) => !m)}
-                    className="mt-4 flex w-full items-center justify-between rounded-2xl border border-white/10 bg-white/[0.02] p-4 transition-colors hover:border-white/25"
+                    onClick={() => setStep("upload")}
+                    className="flex shrink-0 items-center gap-1.5 text-xs text-white/45 transition-colors hover:text-white"
                   >
-                    <span className="flex items-center gap-3 text-sm text-white/80">
-                      {muted ? (
-                        <VolumeX className="h-5 w-5 text-aurora-violet" />
-                      ) : (
-                        <Volume2 className="h-5 w-5 text-aurora-cyan" />
-                      )}
-                      {muted ? "静音导出（推荐）" : "保留原声"}
-                    </span>
-                    <span
-                      className={cn(
-                        "relative h-6 w-11 rounded-full transition-colors duration-200",
-                        muted ? "bg-aurora-violet" : "bg-white/15",
-                      )}
+                    <RefreshCw className="h-3.5 w-3.5" />
+                    换一个
+                  </button>
+                </div>
+
+                {/* 一键生成 */}
+                <button onClick={generate} className="btn-primary w-full !py-4 !text-base">
+                  开始生成实况照片
+                </button>
+
+                {/* 高级设置 */}
+                <details className="group glass rounded-3xl">
+                  <summary className="flex cursor-pointer list-none items-center justify-between px-5 py-4 text-sm font-medium text-white/70 transition-colors hover:text-white [&::-webkit-details-marker]:hidden">
+                    高级设置
+                    <ChevronDown className="h-4 w-4 text-white/40 transition-transform duration-300 group-open:rotate-180" />
+                  </summary>
+                  <div className="space-y-5 border-t border-white/10 px-5 py-5">
+                    <SegmentedControl
+                      id="ready-duration"
+                      options={DURATION_MODES}
+                      value={durationMode}
+                      onChange={changeMode}
+                    />
+
+                    <div>
+                      <label className="mb-2.5 block text-sm text-white/70">
+                        编码格式
+                      </label>
+                      <div className="grid grid-cols-2 gap-3">
+                        {(
+                          [
+                            { id: "h264", label: "H.264", desc: "兼容性最好" },
+                            { id: "hevc", label: "HEVC", desc: "体积更小" },
+                          ] as const
+                        ).map((c) => (
+                          <button
+                            key={c.id}
+                            onClick={() => setCodec(c.id)}
+                            className={cn(
+                              "rounded-2xl border p-4 text-left transition-all duration-200",
+                              codec === c.id
+                                ? "border-aurora-violet/60 bg-aurora-violet/[0.08] shadow-glow-violet"
+                                : "border-white/10 bg-white/[0.02] hover:border-white/25",
+                            )}
+                          >
+                            <span className="block text-sm font-semibold text-white">
+                              {c.label}
+                            </span>
+                            <span className="mt-1 block text-xs text-white/40">
+                              {c.desc}
+                            </span>
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+
+                    <button
+                      onClick={() => setMuted((m) => !m)}
+                      className="flex w-full items-center justify-between rounded-2xl border border-white/10 bg-white/[0.02] p-4 transition-colors hover:border-white/25"
                     >
+                      <span className="flex items-center gap-3 text-sm text-white/80">
+                        {muted ? (
+                          <VolumeX className="h-5 w-5 text-aurora-violet" />
+                        ) : (
+                          <Volume2 className="h-5 w-5 text-aurora-cyan" />
+                        )}
+                        {muted ? "静音导出（推荐）" : "保留原声"}
+                      </span>
                       <span
                         className={cn(
-                          "absolute top-0.5 h-5 w-5 rounded-full bg-white transition-all duration-200",
-                          muted ? "left-[22px]" : "left-0.5",
+                          "relative h-6 w-11 rounded-full transition-colors duration-200",
+                          muted ? "bg-aurora-violet" : "bg-white/15",
                         )}
-                      />
-                    </span>
-                  </button>
-                  {!muted && (
-                    <p className="mt-2 text-xs text-white/35">
-                      片段首尾自动添加 0.2s 音频淡入淡出，防止爆音
-                    </p>
-                  )}
-
-                  {/* 参数摘要 */}
-                  <div className="mt-6 rounded-2xl border border-white/10 bg-black/30 p-5">
-                    <h3 className="text-xs font-semibold tracking-[0.2em] text-white/40">
-                      任务参数摘要
-                    </h3>
-                    <dl className="mt-3 space-y-2 text-sm">
-                      <div className="flex justify-between gap-4">
-                        <dt className="text-white/40">时长模式</dt>
-                        <dd className="text-white">
-                          {durationMode}s
-                          {durationMode === 3 ? "（原生兼容）" : "（超长实况）"}
-                        </dd>
-                      </div>
-                      <div className="flex justify-between gap-4">
-                        <dt className="text-white/40">截取区间</dt>
-                        <dd className="font-mono text-white">
-                          {formatClock(previewParams.clipStart)} –{" "}
-                          {formatClock(
-                            previewParams.clipStart +
-                              effectiveWindow(
-                                videoDuration,
-                                previewParams.durationMode,
-                              ),
+                      >
+                        <span
+                          className={cn(
+                            "absolute top-0.5 h-5 w-5 rounded-full bg-white transition-all duration-200",
+                            muted ? "left-[22px]" : "left-0.5",
                           )}
-                        </dd>
+                        />
+                      </span>
+                    </button>
+
+                    <div>
+                      <label className="mb-2.5 block text-sm text-white/70">
+                        视频短于目标时长时的补齐方式
+                      </label>
+                      <div className="grid gap-2.5 sm:grid-cols-3">
+                        {FALLBACKS.map((f) => (
+                          <button
+                            key={f.value}
+                            onClick={() => setFallback(f.value)}
+                            className={cn(
+                              "rounded-2xl border p-3.5 text-left transition-all duration-200",
+                              fallback === f.value
+                                ? "border-aurora-violet/60 bg-aurora-violet/[0.08]"
+                                : "border-white/10 bg-white/[0.02] hover:border-white/25",
+                            )}
+                          >
+                            <span className="text-sm font-semibold text-white">
+                              {f.label}
+                            </span>
+                            <span className="mt-1 block text-xs leading-relaxed text-white/45">
+                              {f.desc}
+                            </span>
+                          </button>
+                        ))}
                       </div>
-                      <div className="flex justify-between gap-4">
-                        <dt className="text-white/40">封面帧</dt>
-                        <dd className="font-mono text-amber-200">
-                          {previewParams.keyframeTime.toFixed(2)}s → still-image-time
-                        </dd>
-                      </div>
-                      <div className="flex justify-between gap-4">
-                        <dt className="text-white/40">导出时长</dt>
-                        <dd className="font-mono text-white">
-                          {exportSecs.toFixed(1)}s
-                        </dd>
-                      </div>
-                      {short && (
-                        <div className="flex justify-between gap-4">
-                          <dt className="text-white/40">兜底策略</dt>
-                          <dd className="text-amber-200">
-                            {FALLBACK_LABEL[fallback]}
-                          </dd>
+                    </div>
+
+                    {/* 自定义截取片段 */}
+                    <div className="rounded-2xl border border-white/10 bg-black/20 p-4">
+                      <button
+                        onClick={() => setCustomClip((c) => !c)}
+                        className="flex w-full items-center justify-between text-sm text-white/80 transition-colors hover:text-white"
+                      >
+                        <span className="flex items-center gap-2">
+                          <Scissors className="h-4 w-4 text-amber-200" />
+                          自定义截取片段与封面帧
+                        </span>
+                        <ChevronDown
+                          className={cn(
+                            "h-4 w-4 text-white/40 transition-transform duration-300",
+                            customClip && "rotate-180",
+                          )}
+                        />
+                      </button>
+
+                      {customClip && (
+                        <div className="mt-4 space-y-4">
+                          {decodeError ? (
+                            <p className="rounded-xl border border-amber-300/25 bg-amber-300/[0.06] px-4 py-3 text-xs leading-relaxed text-amber-200">
+                              {decodeError}
+                            </p>
+                          ) : (
+                            <>
+                              <div className="overflow-hidden rounded-2xl border border-white/10 bg-black">
+                                <video
+                                  ref={videoRef}
+                                  src={videoUrl ?? undefined}
+                                  muted
+                                  playsInline
+                                  controls
+                                  preload="auto"
+                                  onLoadedMetadata={handleLoadedMetadata}
+                                  onError={() =>
+                                    setDecodeError(
+                                      "该视频无法在浏览器中预览；仍可直接生成。",
+                                    )
+                                  }
+                                  className="block max-h-[36vh] w-full object-contain"
+                                />
+                              </div>
+                              {videoDuration > 0 && (
+                                <>
+                                  <RangeTimeline
+                                    duration={videoDuration}
+                                    windowSecs={durationMode}
+                                    start={clipStart}
+                                    keyframe={keyframe}
+                                    onStartChange={handleStartChange}
+                                    onKeyframeChange={(t) =>
+                                      setKeyframe(Math.round(t * 100) / 100)
+                                    }
+                                  />
+                                  <div className="flex flex-wrap items-center gap-3">
+                                    <span className="chip !border-amber-300/30 !bg-amber-300/[0.08] !text-amber-200">
+                                      封面帧 @ {keyframe.toFixed(2)}s
+                                    </span>
+                                    <button
+                                      onClick={() =>
+                                        setKeyframe(
+                                          Math.round(
+                                            (clipStart + win / 2) * 100,
+                                          ) / 100,
+                                        )
+                                      }
+                                      className="text-xs text-white/45 underline-offset-4 hover:text-white hover:underline"
+                                    >
+                                      重置到片段中点
+                                    </button>
+                                  </div>
+                                  <p className="text-[11px] text-white/30">
+                                    截取区间 {formatClock(clipStart)} –{" "}
+                                    {formatClock(clipStart + win)}
+                                    ，封面帧将写入 still-image-time 元数据
+                                  </p>
+                                </>
+                              )}
+                            </>
+                          )}
                         </div>
                       )}
-                      <div className="flex justify-between gap-4">
-                        <dt className="text-white/40">处理通道</dt>
-                        <dd className={online ? "text-emerald-300" : "text-white/50"}>
-                          {online ? "媒体服务真实转码" : "演示模式"}
-                        </dd>
-                      </div>
-                    </dl>
+                    </div>
                   </div>
-
-                  {/* FFmpeg 参数预览（阶段三联调） */}
-                  {plan && (
-                    <details className="group mt-4 rounded-2xl border border-white/10 bg-black/30">
-                      <summary className="cursor-pointer list-none px-5 py-4 text-sm text-white/60 transition-colors hover:text-white">
-                        查看 FFmpeg 参数
-                        <span className="ml-2 text-[11px] text-white/30">
-                          （后端实际执行的参数）
-                        </span>
-                      </summary>
-                      <div className="space-y-4 border-t border-white/10 px-5 py-4">
-                        <div>
-                          <p className="mb-1.5 text-[11px] tracking-wider text-white/35">
-                            视频封装
-                          </p>
-                          <pre className="overflow-x-auto whitespace-pre-wrap break-all rounded-xl bg-black/60 p-3 font-mono text-[11px] leading-relaxed text-aurora-cyan/90">
-                            {plan.videoArgs.join(" ")}
-                          </pre>
-                        </div>
-                        <div>
-                          <p className="mb-1.5 text-[11px] tracking-wider text-white/35">
-                            封面帧提取
-                          </p>
-                          <pre className="overflow-x-auto whitespace-pre-wrap break-all rounded-xl bg-black/60 p-3 font-mono text-[11px] leading-relaxed text-aurora-violet/90">
-                            {plan.stillArgs.join(" ")}
-                          </pre>
-                        </div>
-                      </div>
-                    </details>
-                  )}
-                </div>
+                </details>
               </div>
             )}
 
@@ -757,7 +675,7 @@ export default function LivePhotoPage() {
                       </div>
                       {realResult.meta.needs_fallback && (
                         <div className="mt-1.5 flex justify-between gap-4">
-                          <span className="text-white/40">兜底策略</span>
+                          <span className="text-white/40">补齐方式</span>
                           <span className="text-amber-200">
                             {FALLBACK_LABEL[
                               realResult.meta.fallback as FallbackStrategy
@@ -806,7 +724,7 @@ export default function LivePhotoPage() {
                         <div className="text-sm">
                           <p className="font-mono text-white/85">IMG_COVER.MOV</p>
                           <p className="mt-0.5 text-xs text-white/40">
-                            演示数据 · 启动媒体服务后生成真实文件
+                            演示数据 · 后端上线后生成真实文件
                           </p>
                         </div>
                       </div>
@@ -814,7 +732,7 @@ export default function LivePhotoPage() {
                     <div className="mt-6 flex flex-col items-center gap-3 sm:flex-row sm:justify-center">
                       <button
                         disabled
-                        title="启动 media-service 后可下载真实文件"
+                        title="后端上线后可下载真实文件"
                         className="btn-primary cursor-not-allowed opacity-40"
                       >
                         <Download className="h-4 w-4" />
