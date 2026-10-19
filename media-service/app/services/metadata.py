@@ -21,9 +21,20 @@ CONTENT_IDENTIFIER_KEY = "com.apple.quicktime.content.identifier"
 LEGACY_CONTENT_IDENTIFIER_KEY = "com.apple.quicktime.content-identifier"
 STILL_IMAGE_TIME_KEY = "com.apple.quicktime.still-image-time"
 
-# Apple iOS\0\0\1MM, one IFD entry for tag 17 (ASCII, 37 bytes, offset 32).
-_APPLE_MAKERNOTE_PREFIX = bytes.fromhex(
-    "4170706c6520694f530000014d4d000100110002000000250000002000000000"
+# "Apple iOS\0" 签名 + 标准大端 TIFF：魔数必须是 0x002a(42)，
+# 否则 iOS 的严格 TIFF 解析器会拒绝整个 MakerNote，导致 key 17 读不到、
+# 相册无法把 JPG 和 MOV 配对成实况照片。
+# 结构（TIFF 起始于 "MM"）：
+#   MM 002a | ifd_offset=8 | count=1 | tag=17,type=ASCII(2),count=37,offset=26 | UUID\0
+_APPLE_MAKERNOTE_PREFIX = (
+    b"Apple iOS\x00"  # 10 字节签名
+    b"MM\x00\x2a"  # TIFF 头：大端，魔数 42
+    b"\x00\x00\x00\x08"  # 首个 IFD 偏移 = 8
+    b"\x00\x01"  # 1 个目录项
+    b"\x00\x11"  # tag 17 = ContentIdentifier
+    b"\x00\x02"  # 类型 ASCII
+    b"\x00\x00\x00\x25"  # 数量 37（36 位 UUID + \0）
+    b"\x00\x00\x00\x16"  # 值偏移 = 22（自 TIFF 起始：2+2+4+2+12）
 )
 _UUID_RE = re.compile(
     rb"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
