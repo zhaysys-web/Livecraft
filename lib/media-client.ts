@@ -73,6 +73,31 @@ function abs(url: string): string {
   return url.startsWith("http") ? url : `${mediaBase()}${url}`;
 }
 
+/**
+ * 带超时的 fetch。超时后抛出中文错误（Render 冷启动场景下提示用户稍后重试）。
+ * 注意：转码请求走同步后端，超时必须远大于单次转码耗时。
+ */
+export async function fetchWithTimeout(
+  input: RequestInfo | URL,
+  init: RequestInit = {},
+  timeoutMs = 30000,
+): Promise<Response> {
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(input, { ...init, signal: controller.signal });
+  } catch (e) {
+    if (e instanceof DOMException && e.name === "AbortError") {
+      throw new Error(
+        `请求超时（${Math.round(timeoutMs / 1000)} 秒），媒体服务可能正在冷启动，请稍后重试`,
+      );
+    }
+    throw e instanceof Error ? e : new Error("网络请求失败，请检查网络后重试");
+  } finally {
+    window.clearTimeout(timer);
+  }
+}
+
 export async function livePhotoConvert(
   video: File,
   p: LivePhotoParams,
@@ -87,7 +112,12 @@ export async function livePhotoConvert(
   fd.append("muted", String(p.muted));
   fd.append("audio_fade_secs", String(p.audioFadeSecs ?? 0.2));
   if (p.contentIdentifier) fd.append("content_identifier", p.contentIdentifier);
-  const res = await fetch(`${mediaBase()}/api/live-photo`, { method: "POST", body: fd });
+  // 转码在服务端同步执行，超时设为 10 分钟
+  const res = await fetchWithTimeout(
+    `${mediaBase()}/api/live-photo`,
+    { method: "POST", body: fd },
+    600000,
+  );
   if (!res.ok) {
     const text = await res.text();
     let detail = text;
@@ -107,18 +137,23 @@ export async function livePhotoConvert(
 }
 
 export async function deleteLivePhotoJob(jobId: string): Promise<void> {
-  await fetch(`${mediaBase()}/api/jobs/${encodeURIComponent(jobId)}`, {
-    method: "DELETE",
-    keepalive: true,
-  });
+  await fetchWithTimeout(
+    `${mediaBase()}/api/jobs/${encodeURIComponent(jobId)}`,
+    { method: "DELETE", keepalive: true },
+    10000,
+  );
 }
 
 export async function parseShareLink(shareText: string): Promise<ParseResult> {
-  const res = await fetch(`${mediaBase()}/api/parser`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ share_text: shareText }),
-  });
+  const res = await fetchWithTimeout(
+    `${mediaBase()}/api/parser`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ share_text: shareText }),
+    },
+    60000,
+  );
   const body = await res.json();
   if (!res.ok) throw new Error(body.message ?? `解析失败（${res.status}）`);
   return body as ParseResult;
@@ -133,13 +168,19 @@ export async function inpaintImage(
   fd.append("image", image);
   fd.append("mask", mask);
   fd.append("method", method);
-  const res = await fetch(`${mediaBase()}/api/inpaint`, { method: "POST", body: fd });
+  const res = await fetchWithTimeout(
+    `${mediaBase()}/api/inpaint`,
+    { method: "POST", body: fd },
+    120000,
+  );
   if (!res.ok) throw new Error(`修复失败（${res.status}）：${await res.text()}`);
   return res.blob();
 }
 
-export async function mediaHealth(): Promise<{ ok: boolean; ffmpeg: string }> {
-  const res = await fetch(`${mediaBase()}/api/health`);
+export async function mediaHealth(
+  timeoutMs = 8000,
+): Promise<{ ok: boolean; ffmpeg: string }> {
+  const res = await fetchWithTimeout(`${mediaBase()}/api/health`, {}, timeoutMs);
   if (!res.ok) throw new Error("media-service 不可用");
   return res.json();
 }

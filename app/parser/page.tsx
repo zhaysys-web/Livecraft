@@ -310,6 +310,14 @@ export default function ParserPage() {
                         <dd className="text-amber-300/90">{w}</dd>
                       </div>
                     ))}
+                    {realResult.strategy === "fallback_api" && (
+                      <div className="flex gap-2">
+                        <dt className="w-14 shrink-0 text-white/30">来源</dt>
+                        <dd className="text-white/45">
+                          本次经第三方备用解析服务获取；直链有效期较短，请尽快下载。
+                        </dd>
+                      </div>
+                    )}
                   </dl>
                   <div className="mt-4 flex flex-wrap gap-2.5">
                     <a

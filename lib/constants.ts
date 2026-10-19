@@ -25,12 +25,12 @@ export const TOOLS: ToolMeta[] = [
     en: "Live Photo Studio",
     tagline: "把任意视频变成 iPhone 相册里的实况照片",
     description:
-      "上传视频，拖动时间轴拾取封面帧，后端经 FFmpeg 重封装为 H.264/HEVC 标准 Live Photo（≤3s），注入 Apple ContentIdentifier 元数据，一键打包下载。",
+      "上传视频，一键生成 Apple 实况照片：后端用 FFmpeg 探测参数，兼容视频走流复制不重编码，JPG 与 MOV 写入严格匹配的 ContentIdentifier；结果页可直接存入 iPhone 相册，ZIP 兜底。",
     features: [
-      "封面帧时间轴拾取 / 自由上传封面图",
-      "H.264 / HEVC 双格式重封装",
-      "ContentIdentifier 元数据自动注入",
-      "静音 / 原音切换，一键 ZIP 打包",
+      "3 秒 / 5 秒时长模式，定长滑窗裁剪",
+      "区间内拖动选择实况封面帧",
+      "兼容视频流复制，画质无损",
+      "JPG / MOV 元数据严格配对校验",
     ],
     href: "/live-photo",
     icon: Clapperboard,
@@ -42,12 +42,12 @@ export const TOOLS: ToolMeta[] = [
     en: "Watermark-free Parser",
     tagline: "粘贴分享链接，拿回干净的原画质视频",
     description:
-      "支持抖音、快手、小红书、TikTok 等主流平台。多重容错解析管道：Headless 抓取 → 正则 API 提取 → 第三方引擎回退，实时预览一键下载。",
+      "支持抖音、快手、小红书、TikTok 分享口令。多级解析管道：页面 JSON → 正则提取 → 第三方备用，解析出无水印直链并经签名代理播放下载。",
     features: [
       "抖音 / 快手 / 小红书 / TikTok 分享链接",
-      "Headless + 正则 + 第三方三级容错管道",
-      "UA 伪装与防封禁机制",
-      "原画质实时预览，一键下载",
+      "页面解析 + 正则提取 + 第三方备用",
+      "移动端 / 桌面端 UA 适配",
+      "签名代理直链，支持断点续传",
     ],
     href: "/parser",
     icon: Link2,
@@ -59,12 +59,12 @@ export const TOOLS: ToolMeta[] = [
     en: "Inpaint Eraser",
     tagline: "笔刷一抹，水印消失",
     description:
-      "Canvas 画笔涂抹水印区域，轻量场景走前端 OpenCV/纹理修补，高精度场景对接 LaMa / SD Inpainting。撤销重做、Before-After 对比滑块一应俱全。",
+      "Canvas 画笔涂抹水印区域：小面积走前端轻量填充，大面积走后端 OpenCV（TELEA / NS）高精度修复。撤销重做、Before-After 对比滑块一应俱全。",
     features: [
       "画笔粗细调节 / 橡皮擦 / 撤销重做",
       "Before-After 对比滑块",
-      "前端轻量修补 + AI 高精度修复双通道",
-      "本地 ONNX 模型可选部署",
+      "前端轻量填充 + 后端高精度双通道",
+      "掩膜精确到像素",
     ],
     href: "/inpaint",
     icon: Eraser,
@@ -72,10 +72,12 @@ export const TOOLS: ToolMeta[] = [
   },
 ];
 
-export const PHASES = [
+type PhaseStatus = "done" | "doing" | "todo";
+
+export const PHASES: { no: string; name: string; desc: string; status: PhaseStatus }[] = [
   { no: "01", name: "设计系统", desc: "工程初始化 · Tokens · 布局骨架", status: "done" },
-  { no: "02", name: "交互原型", desc: "Dropzone · 时间轴拾取器 · Canvas 画笔", status: "doing" },
-  { no: "03", name: "媒体管道", desc: "Live Photo 封装 · 解析管道 · 修复服务", status: "todo" },
-  { no: "04", name: "健壮性测试", desc: "超时/大文件/异常链接 · Toast 降级", status: "todo" },
-  { no: "05", name: "生产部署", desc: "Docker · Vercel · Nginx HTTPS", status: "todo" },
-] as const;
+  { no: "02", name: "交互原型", desc: "Dropzone · 时间轴拾取器 · Canvas 画笔", status: "done" },
+  { no: "03", name: "媒体管道", desc: "Live Photo 封装 · 解析管道 · 修复服务", status: "done" },
+  { no: "04", name: "健壮性测试", desc: "超时/大文件/异常链接 · Toast 降级", status: "done" },
+  { no: "05", name: "生产部署", desc: "Vercel 前端 · Render 后端 · 全免费上线", status: "done" },
+];

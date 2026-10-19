@@ -26,6 +26,7 @@ import {
   type BarAction,
 } from "@/components/tools/mobile-action-bar";
 import { ServiceStatusPill } from "@/components/tools/service-status";
+import { WeChatTip } from "@/components/tools/wechat-tip";
 import { useMediaService } from "@/hooks/use-media-service";
 import {
   deleteLivePhotoJob,
@@ -901,7 +902,8 @@ export default function LivePhotoPage() {
                       </p>
                     )}
 
-                    <div className="pt-2">
+                    <div className="space-y-3 pt-2">
+                      <WeChatTip />
                       {shareState === "loading" ? (
                         <button
                           disabled

@@ -18,9 +18,29 @@ const spaceGrotesk = Space_Grotesk({
 });
 
 export const metadata: Metadata = {
+  metadataBase: new URL("https://livecraft-ten.vercel.app"),
   title: "LiveCraft 灵动映像 — 高美感多媒体处理工作台",
   description:
     "视频转 Apple Live Photo、短视频无水印解析、图片去水印擦除，三件工具，一个深色工作台。",
+  icons: {
+    icon: "/favicon.svg",
+    apple: "/apple-touch-icon.png",
+  },
+  openGraph: {
+    title: "LiveCraft 灵动映像",
+    description: "视频转 Apple 实况照片 · 短视频无水印解析 · 图片去水印",
+    url: "https://livecraft-ten.vercel.app",
+    siteName: "LiveCraft 灵动映像",
+    images: [{ url: "/og.png", width: 1200, height: 630 }],
+    locale: "zh_CN",
+    type: "website",
+  },
+  twitter: {
+    card: "summary_large_image",
+    title: "LiveCraft 灵动映像",
+    description: "视频转 Apple 实况照片 · 短视频无水印解析 · 图片去水印",
+    images: ["/og.png"],
+  },
 };
 
 export default function RootLayout({

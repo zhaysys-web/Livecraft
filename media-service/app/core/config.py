@@ -23,15 +23,43 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 JOB_TTL_SECONDS = _env_int("JOB_TTL_SECONDS", 86400)
 MAX_UPLOAD_MB = _env_int("MAX_UPLOAD_MB", 500)
+# 单个视频时长上限（秒），ffprobe 探测后强制执行
+MAX_VIDEO_DURATION_SECS = _env_int("MAX_VIDEO_DURATION_SECS", 600)
+
+# ---- 公网安全加固 ----
+# 通用 API 限流（次/分钟/IP）
+RATE_LIMIT_PER_MINUTE = _env_int("RATE_LIMIT_PER_MINUTE", 120)
+# 转码接口更严格：FFmpeg 是 CPU 密集型
+RATE_LIMIT_CONVERT_PER_MINUTE = _env_int("RATE_LIMIT_CONVERT_PER_MINUTE", 8)
+RATE_LIMIT_PARSER_PER_MINUTE = _env_int("RATE_LIMIT_PARSER_PER_MINUTE", 30)
+RATE_LIMIT_INPAINT_PER_MINUTE = _env_int("RATE_LIMIT_INPAINT_PER_MINUTE", 20)
+# 同时进行的转码任务数（Render 免费版 CPU 弱，默认 2）
+MAX_CONCURRENT_JOBS = _env_int("MAX_CONCURRENT_JOBS", 2)
+SECURITY_HEADERS_ENABLED = _env("SECURITY_HEADERS_ENABLED", "1").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 
 FFMPEG_BIN = _env("FFMPEG_BIN", "ffmpeg")
 FFPROBE_BIN = _env("FFPROBE_BIN", "ffprobe")
 
-CORS_ORIGINS = [
-    o.strip()
-    for o in _env("CORS_ORIGINS", "*").split(",")
-    if o.strip()
-]
+def _parse_cors_origins() -> list[str]:
+    raw = _env("CORS_ORIGINS", "").strip()
+    if raw == "":
+        # 未配置时使用白名单（生产前端 + 本地开发）
+        return [
+            "https://livecraft-ten.vercel.app",
+            "http://localhost:3000",
+            "http://localhost:3102",
+        ]
+    # 显式配置（含 "*"）按用户意图执行；要收紧请把 Render 的 CORS_ORIGINS
+    # 改为前端域名（逗号分隔），不要用 "*"
+    return [o.strip() for o in raw.split(",") if o.strip()]
+
+
+CORS_ORIGINS = _parse_cors_origins()
 
 THIRD_PARTY_RESOLVER_URL = _env("THIRD_PARTY_RESOLVER_URL", "")
 

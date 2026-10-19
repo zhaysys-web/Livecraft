@@ -14,6 +14,7 @@ from datetime import datetime
 from pathlib import Path
 
 from app.services import ffmpeg_plan, livephoto_mov, metadata
+from app.core import config
 
 
 @dataclass
@@ -89,6 +90,11 @@ def run_livephoto_job(
     out_dir.mkdir(parents=True, exist_ok=True)
     info = ffmpeg_plan.probe_video(src)
     _prepare_params(params, info)
+
+    if params.video_duration > config.MAX_VIDEO_DURATION_SECS:
+        raise ValueError(
+            f"视频时长 {params.video_duration:.1f}s 超过 {config.MAX_VIDEO_DURATION_SECS}s 上限"
+        )
 
     still_path = out_dir / "still.jpg"
     mov_path = out_dir / "live.mov"

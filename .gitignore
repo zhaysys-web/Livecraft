@@ -44,3 +44,4 @@ uploads/
 .runlogs/
 public/_test-*
 /*-first.png
+.venv/

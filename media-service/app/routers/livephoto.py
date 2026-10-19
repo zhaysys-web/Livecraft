@@ -31,6 +31,9 @@ _UUID_RE = re.compile(
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 )
 
+# 转码并发控制：FFmpeg 是 CPU 密集型，超过上限的请求排队等待
+_transcode_semaphore = asyncio.Semaphore(config.MAX_CONCURRENT_JOBS)
+
 
 def _livephoto_root() -> Path:
     return (config.DATA_DIR / "livephoto").resolve()
@@ -160,9 +163,10 @@ async def create_live_photo(
     )
 
     try:
-        result = await asyncio.to_thread(
-            livephoto.run_livephoto_job, src, directory, params
-        )
+        async with _transcode_semaphore:
+            result = await asyncio.to_thread(
+                livephoto.run_livephoto_job, src, directory, params
+            )
     except subprocess.CalledProcessError as exc:
         shutil.rmtree(directory, ignore_errors=True)
         detail = (exc.stderr or "FFmpeg 处理失败").strip()[-800:]

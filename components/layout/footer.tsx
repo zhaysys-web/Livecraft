@@ -1,4 +1,5 @@
-import { Aperture } from "lucide-react";
+import Link from "next/link";
+import { Aperture, Github } from "lucide-react";
 
 export function Footer() {
   return (
@@ -8,6 +9,23 @@ export function Footer() {
           <Aperture className="h-4 w-4" />
           <span className="text-xs tracking-[0.25em]">LIVECRAFT · 灵动映像</span>
         </div>
+        <nav className="flex items-center gap-5 text-xs text-white/40">
+          <Link href="/privacy" className="transition-colors hover:text-white">
+            隐私政策
+          </Link>
+          <Link href="/terms" className="transition-colors hover:text-white">
+            使用条款
+          </Link>
+          <a
+            href="https://github.com/zhaysys-web/Livecraft"
+            target="_blank"
+            rel="noreferrer"
+            className="inline-flex items-center gap-1.5 transition-colors hover:text-white"
+          >
+            <Github className="h-3.5 w-3.5" />
+            GitHub
+          </a>
+        </nav>
         <p className="text-xs text-white/30">
           Creative media workstation · Crafted with Next.js & FastAPI · 2026
         </p>
