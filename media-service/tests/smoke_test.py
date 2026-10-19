@@ -98,6 +98,18 @@ def main() -> int:
     check("jpg MakerNote 配对",
           metadata.read_jpg_content_identifier(r.still_path)
           == "11111111-2222-3333-4444-555555555555")
+    # 严格校验 MakerNote 是标准 TIFF（iOS 用严格解析器读 key 17，
+    # 魔数不是 42 会导致整个 MakerNote 被拒、无法配对）
+    import struct as _struct
+    _raw = r.still_path.read_bytes()
+    _i = _raw.find(b"Apple iOS\x00")
+    _tiff = _raw[_i + 10:_i + 10 + 32]
+    _magic = _struct.unpack(">H", _tiff[2:4])[0]
+    _ifd = _struct.unpack(">I", _tiff[4:8])[0]
+    _tag, _typ, _cnt, _voff = _struct.unpack(">HHII", _tiff[_ifd + 2:_ifd + 14])
+    check("jpg MakerNote 是标准 TIFF（magic=42, tag=17, ASCII）",
+          _magic == 42 and _tag == 17 and _typ == 2 and _cnt == 37,
+          f"magic={_magic} tag={_tag} type={_typ} count={_cnt}")
     live_meta = livephoto_mov.read_apple_metadata(r.mov_path)
     check("still-image-time 写入时间轨且使用片段内相对时间",
           abs(live_meta.still_time - 1.5) < 0.01
