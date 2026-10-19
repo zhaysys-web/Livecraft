@@ -1,0 +1,18 @@
+# Render 一键部署（免费版）
+# 用法：https://dashboard.render.com → New → Blueprint → 选择本仓库 → Apply
+# render.yaml 会被自动识别，创建一个免费的 Docker Web Service。
+# 部署完成后记下地址（https://livecraft-media.onrender.com），
+# 填到 Vercel 的 NEXT_PUBLIC_MEDIA_SERVICE_URL 环境变量里。
+
+services:
+  - type: web
+    name: livecraft-media
+    runtime: docker
+    dockerfilePath: ./media-service/Dockerfile
+    dockerContext: .
+    plan: free
+    healthCheckPath: /api/health
+    envVars:
+      - key: CORS_ORIGINS
+        value: "*"
+      # Render 自动注入 $PORT，app/core/config.py 会优先读取，无需配置

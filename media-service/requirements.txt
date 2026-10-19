@@ -1,0 +1,10 @@
+fastapi>=0.115
+uvicorn[standard]>=0.30
+python-multipart>=0.0.9
+pillow>=10.0
+piexif>=1.1.3
+requests>=2.31
+# 可选：有它时去水印用 OpenCV 高精度修复；缺失则自动降级为 PIL 邻域填充
+opencv-python-headless>=4.8
+# 测试用（tests/smoke_test.py 走 FastAPI TestClient）
+httpx>=0.27

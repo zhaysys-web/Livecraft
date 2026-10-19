@@ -1,0 +1,40 @@
+# LiveCraft 本地一键启动（自用免费方案）
+# 用法：docker compose up --build
+# 前端 http://localhost:3000，后端 http://localhost:8000
+
+services:
+  media:
+    build: ./media-service
+    ports:
+      - "8000:8000"
+    environment:
+      CORS_ORIGINS: "http://localhost:3000"
+      MEDIA_SERVICE_PORT: 8000
+    volumes:
+      - media-data:/data
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  web:
+    build:
+      context: .
+      args:
+        NEXT_PUBLIC_MEDIA_SERVICE_URL: http://localhost:8000
+    ports:
+      - "3000:3000"
+    depends_on:
+      media:
+        condition: service_healthy
+
+volumes:
+  media-data:
