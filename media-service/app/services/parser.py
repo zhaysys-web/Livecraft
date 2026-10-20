@@ -411,7 +411,7 @@ def _dtk_credentials() -> tuple[str, str] | None:
     try:
         response = requests.get(
             f"{config.PARSER_FALLBACK_API_URL}/api/v1/auth/demo",
-            timeout=12,
+            timeout=20,
             headers={"Accept": "application/json", "User-Agent": DESKTOP_UA},
         )
         response.raise_for_status()
@@ -441,7 +441,7 @@ def _dtk_login(*, force: bool = False) -> str:
             response = requests.post(
                 f"{config.PARSER_FALLBACK_API_URL}/api/v1/auth/login",
                 json={"username": credentials[0], "password": credentials[1]},
-                timeout=15,
+                timeout=30,
                 headers={"Accept": "application/json", "User-Agent": DESKTOP_UA},
             )
             response.raise_for_status()
@@ -521,6 +521,51 @@ def _dtk_parse_result(data: dict, platform: Platform) -> ParseResult | None:
 
 
 def _parse_with_fallback_api(url: str, platform: Platform) -> ParseResult | None:
+    """备用解析服务（公共演示账号）存在间歇性超时/限流，失败后清会话重试一次。"""
+    result = _parse_with_fallback_api_once(url, platform)
+    if result:
+        return result
+    global _dtk_cookie, _dtk_cookie_expires_at
+    _dtk_cookie = ""
+    _dtk_cookie_expires_at = 0.0
+    time.sleep(2.5)
+    return _parse_with_fallback_api_once(url, platform)
+
+
+def _parse_with_tikwm(url: str, platform: Platform) -> ParseResult | None:
+    """第二备用源 tikwm（免登录）：对 TikTok 稳定，抖音视链接形态而定。"""
+    if platform not in ("douyin", "tiktok"):
+        return None
+    try:
+        r = requests.get(
+            "https://www.tikwm.com/api/",
+            params={"url": url, "hd": "1"},
+            timeout=25,
+            headers={"Accept": "application/json", "User-Agent": DESKTOP_UA},
+        )
+        r.raise_for_status()
+        body = r.json()
+    except (requests.RequestException, ValueError):
+        return None
+    if body.get("code") != 0:
+        return None
+    data = body.get("data") or {}
+    video_url = str(data.get("play") or "")
+    if not video_url:
+        return None
+    author = data.get("author") or {}
+    return ParseResult(
+        platform=platform,
+        video_url=video_url,
+        title=str(data.get("title") or "")[:200],
+        author=str(author.get("nickname") or "") if isinstance(author, dict) else "",
+        cover_url=str(data.get("cover") or ""),
+        strategy="tikwm",
+        warnings=["平台官方接口风控升级，已通过第二备用解析服务完成；分享链接会发送给该服务。"],
+    )
+
+
+def _parse_with_fallback_api_once(url: str, platform: Platform) -> ParseResult | None:
     base = config.PARSER_FALLBACK_API_URL
     if not base or platform not in ("douyin", "tiktok"):
         return None
@@ -640,6 +685,10 @@ def parse_share_link(share_text: str) -> ParseResult:
 
     # 抖音 / TikTok 的网页接口已启用签名校验，优先走独立解析服务。
     fallback = _parse_with_fallback_api(url, platform)
+    if fallback:
+        return fallback
+
+    fallback = _parse_with_tikwm(final_url or url, platform)
     if fallback:
         return fallback
 
