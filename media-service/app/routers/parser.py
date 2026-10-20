@@ -42,7 +42,7 @@ async def parse_link(req: ParseRequest, request: Request):
     base = _public_base(request)
     if result.content_kind == "image_album":
         images = [
-            base + parser_svc.make_media_proxy_path(u, download=True)
+            base + parser_svc.make_media_proxy_path(u)
             for u in result.images
         ]
         music_url = (
