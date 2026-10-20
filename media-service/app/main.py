@@ -89,7 +89,7 @@ async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
 
 app = FastAPI(
     title="LiveCraft media-service",
-    version="0.4.1",
+    version="0.4.2",
     lifespan=lifespan,
 )
 
@@ -142,7 +142,7 @@ def health():
         "ffmpeg": v,
         "opencv": cv2_version,
         "cors_origins": config.CORS_ORIGINS,
-        "version": "0.4.1",
+        "version": "0.4.2",
         "limits": {
             "max_upload_mb": config.MAX_UPLOAD_MB,
             "max_video_duration_secs": config.MAX_VIDEO_DURATION_SECS,

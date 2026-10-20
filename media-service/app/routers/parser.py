@@ -40,12 +40,37 @@ async def parse_link(req: ParseRequest, request: Request):
             content={"error_code": e.code, "message": str(e)},
         )
     base = _public_base(request)
+    if result.content_kind == "image_album":
+        images = [
+            base + parser_svc.make_media_proxy_path(u, download=True)
+            for u in result.images
+        ]
+        music_url = (
+            base + parser_svc.make_media_proxy_path(result.music_url, download=True)
+            if result.music_url
+            else ""
+        )
+        return {
+            "platform": result.platform,
+            "content_kind": "image_album",
+            "video_url": "",
+            "download_url": "",
+            "title": result.title,
+            "author": result.author,
+            "cover_url": images[0] if images else result.cover_url,
+            "images": images,
+            "music_url": music_url,
+            "music_title": result.music_title,
+            "strategy": result.strategy,
+            "warnings": result.warnings,
+        }
     video_url = base + parser_svc.make_media_proxy_path(result.video_url)
     download_url = base + parser_svc.make_media_proxy_path(
         result.video_url, download=True
     )
     return {
         "platform": result.platform,
+        "content_kind": "video",
         "video_url": video_url,
         "download_url": download_url,
         "title": result.title,

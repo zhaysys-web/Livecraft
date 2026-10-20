@@ -70,6 +70,7 @@ _MEDIA_HOST_SUFFIXES = (
     ".xhscdn.net",
     ".xhsimg.com",
     ".kuaishou.com",
+    ".douyinstatic.com",
     ".kwimgs.com",
     ".kwaicdn.com",
     ".kscloud.com",
@@ -108,6 +109,11 @@ class ParseResult:
     download_url: str = ""
     strategy: str = ""
     warnings: list[str] = field(default_factory=list)
+    # 图文作品（image_album）专用：无视频流，带图片组与背景音乐
+    content_kind: str = "video"  # video | image_album
+    images: list[str] = field(default_factory=list)
+    music_url: str = ""
+    music_title: str = ""
 
 
 def extract_share_url(text: str) -> str:
@@ -473,7 +479,42 @@ def _dtk_auth_headers(*, force: bool = False) -> dict[str, str] | None:
 
 
 def _dtk_parse_result(data: dict, platform: Platform) -> ParseResult | None:
-    if not isinstance(data, dict) or data.get("kind") != "video":
+    if not isinstance(data, dict):
+        return None
+    # 图文作品：没有视频流，返回图片组 + 背景音乐，避免误报为「风控失败」
+    if data.get("kind") == "image_album":
+        media = data.get("media") or {}
+        images: list[str] = []
+        for img in media.get("images") or []:
+            if isinstance(img, dict) and isinstance(img.get("url"), str) and img["url"]:
+                images.append(img["url"])
+            elif isinstance(img, str) and img:
+                images.append(img)
+        if not images:
+            return None
+        music = data.get("music") or {}
+        covers = media.get("covers") or []
+        cover_url = images[0]
+        if isinstance(covers, list) and covers and isinstance(covers[0], dict) and covers[0].get("url"):
+            cover_url = str(covers[0]["url"])
+        author = data.get("author") or {}
+        return ParseResult(
+            platform=str(data.get("platform") or platform),
+            video_url="",
+            title=str(data.get("title") or data.get("description") or "")[:200],
+            author=str(author.get("nickname") or "") if isinstance(author, dict) else "",
+            cover_url=cover_url,
+            strategy="fallback_api",
+            warnings=[
+                "这是一条图文作品，没有视频；已提取全部图片，背景音乐可单独下载。",
+                "平台官方接口风控升级，已通过第三方备用解析服务完成；分享链接会发送给该服务。",
+            ],
+            content_kind="image_album",
+            images=images,
+            music_url=str(music.get("play_url") or "") if isinstance(music, dict) else "",
+            music_title=str(music.get("title") or "") if isinstance(music, dict) else "",
+        )
+    if data.get("kind") != "video":
         return None
     media = data.get("media") or {}
     candidates: list[dict] = []
