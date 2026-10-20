@@ -84,10 +84,10 @@ _dtk_cookie_expires_at = 0.0
 _dtk_demo_credentials: tuple[str, str] | None = None
 
 _DOMAIN_PATTERNS: dict[Platform, list[str]] = {
-    "douyin": [r"douyin\.com", r"v\.douyin\.com", r"iesdouyin\.com"],
-    "kuaishou": [r"kuaishou\.com", r"v\.kuaishou\.com", r"gifshow\.com"],
-    "xiaohongshu": [r"xiaohongshu\.com", r"xhslink\.com"],
-    "tiktok": [r"tiktok\.com", r"vt\.tiktok\.com", r"vm\.tiktok\.com"],
+    "douyin": ["douyin.com", "iesdouyin.com"],
+    "kuaishou": ["kuaishou.com", "gifshow.com"],
+    "xiaohongshu": ["xiaohongshu.com", "xhslink.com"],
+    "tiktok": ["tiktok.com"],
 }
 
 _URL_RE = re.compile(r"https?://[^\s\"'<>\\]+", re.IGNORECASE)
@@ -124,8 +124,15 @@ def extract_share_url(text: str) -> str:
 
 
 def detect_platform(url: str) -> Platform:
-    for platform, patterns in _DOMAIN_PATTERNS.items():
-        if any(re.search(p, url, re.IGNORECASE) for p in patterns):
+    # 必须按真实主机名判断：直接对整串 URL 做正则会被
+    # https://v.douyin.com@127.0.0.1/ 这类 userinfo 混淆链接绕过，
+    # 使服务端去抓取攻击者指定的地址（SSRF 面）。
+    try:
+        host = (urlsplit(url).hostname or "").lower()
+    except ValueError:
+        host = ""
+    for platform, domains in _DOMAIN_PATTERNS.items():
+        if any(host == d or host.endswith("." + d) for d in domains):
             return platform
     raise ParserError("unknown_platform", f"暂不支持该平台的链接：{url[:80]}")
 
